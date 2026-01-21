@@ -1,0 +1,769 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="/Users/itsuki.matsumoto/claude-code"
+MEETING_BIN="$ROOT/tools/meeting/meeting"
+TEMP_DIR="$ROOT/knowledge/meetings/_audio"
+PID_FILE="$TEMP_DIR/.recording.pid"
+INFO_FILE="$TEMP_DIR/.recording.info"
+AUDIO_BACKUP_FILE="$TEMP_DIR/.audio_output_backup"
+LOG_DIR="/Users/itsuki.matsumoto/claude-code/knowledge/meetings/log"
+LOG_DATE=""
+LOG_FILE=""
+LOG_RETENTION_DAYS="${MEETING_LOG_RETENTION_DAYS:-14}"
+WATCH_LOCK_DIR="$TEMP_DIR/.watch.lock"
+
+# 会議用マルチ出力デバイス名
+MEETING_AUDIO_EARPHONE="${MEETING_AUDIO_EARPHONE:-会議用イヤホン}"
+MEETING_AUDIO_SPEAKER="${MEETING_AUDIO_SPEAKER:-会議用スピーカー}"
+DEFAULT_OUTPUT_DEVICE="${MEETING_DEFAULT_OUTPUT_DEVICE:-MacBook Airのスピーカー}"
+MEETING_WEB_OUTPUT_DEVICE="${MEETING_WEB_OUTPUT_DEVICE:-auto}"
+MEETING_WEB_OUTPUT_AUTO_SWITCH="${MEETING_WEB_OUTPUT_AUTO_SWITCH:-1}"
+MEETING_MULTI_SOUND_CHANGER_APP="${MEETING_MULTI_SOUND_CHANGER_APP:-/Applications/MultiSoundChanger.app}"
+MEETING_MULTI_SOUND_CHANGER_CHECK="${MEETING_MULTI_SOUND_CHANGER_CHECK:-1}"
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+mkdir -p "$TEMP_DIR"
+
+cleanup_old_logs() {
+    find "$LOG_DIR" -maxdepth 1 -type f -name 'watch-*.log' -mtime "+$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
+    find "$LOG_DIR" -maxdepth 1 -type f -name 'meeting-*.log' -mtime "+$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
+}
+
+ensure_log_file() {
+    local today
+    today="$(date '+%Y-%m-%d')"
+    if [ "$LOG_DATE" != "$today" ]; then
+        LOG_DATE="$today"
+        LOG_FILE="$LOG_DIR/watch-$LOG_DATE.log"
+        mkdir -p "$LOG_DIR"
+        ln -sf "$LOG_FILE" "$LOG_DIR/watch.log" 2>/dev/null || true
+        cleanup_old_logs
+    fi
+}
+
+# ログ出力
+log_message() {
+    local timestamp
+    ensure_log_file
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "[$timestamp] $1" >> "$LOG_FILE"
+}
+export MEETING_STORAGE_MODE="${MEETING_STORAGE_MODE:-auto}"
+export MEETING_KEEP_AUDIO="${MEETING_KEEP_AUDIO:-${MEETING_WATCH_KEEP_AUDIO:-0}}"
+
+cleanup_watch_lock() {
+    if [ -f "$WATCH_LOCK_DIR/pid" ]; then
+        local existing_pid
+        existing_pid="$(cat "$WATCH_LOCK_DIR/pid" 2>/dev/null || true)"
+        if [ "$existing_pid" = "$$" ]; then
+            rm -rf "$WATCH_LOCK_DIR"
+        fi
+    fi
+}
+
+acquire_watch_lock() {
+    if mkdir "$WATCH_LOCK_DIR" 2>/dev/null; then
+        echo "$$" > "$WATCH_LOCK_DIR/pid"
+        return 0
+    fi
+
+    local existing_pid=""
+    if [ -f "$WATCH_LOCK_DIR/pid" ]; then
+        existing_pid="$(cat "$WATCH_LOCK_DIR/pid" 2>/dev/null || true)"
+        if [ -n "$existing_pid" ] && ps -p "$existing_pid" > /dev/null 2>&1; then
+            log_message "Another watch process is running (pid=$existing_pid), exiting."
+            exit 0
+        fi
+    fi
+
+    log_message "Stale watch lock detected (pid=${existing_pid:-unknown}), removing."
+    rm -rf "$WATCH_LOCK_DIR"
+    if mkdir "$WATCH_LOCK_DIR" 2>/dev/null; then
+        echo "$$" > "$WATCH_LOCK_DIR/pid"
+        return 0
+    fi
+
+    log_message "Failed to acquire watch lock, exiting."
+    exit 1
+}
+
+acquire_watch_lock
+trap cleanup_watch_lock EXIT
+
+POLL_INTERVAL="${MEETING_WATCH_INTERVAL:-5}"
+
+# 現在の出力デバイスを取得
+get_current_output_device() {
+    if command -v SwitchAudioSource >/dev/null 2>&1; then
+        SwitchAudioSource -c -t output -f human 2>/dev/null || echo ""
+    else
+        echo ""
+    fi
+}
+
+get_output_device_record_by_name() {
+    local target="$1"
+    if [ -z "$target" ]; then
+        return 1
+    fi
+    if ! command -v SwitchAudioSource >/dev/null 2>&1; then
+        return 1
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        return 1
+    fi
+    python3 - "$target" << 'PY'
+import json
+import subprocess
+import sys
+
+target = sys.argv[1]
+try:
+    output = subprocess.check_output(
+        ["SwitchAudioSource", "-a", "-t", "output", "-f", "json"],
+        stderr=subprocess.STDOUT,
+    )
+except Exception:
+    sys.exit(1)
+
+for line in output.decode("utf-8", errors="ignore").splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+    except Exception:
+        continue
+    if obj.get("name") == target:
+        print(f"{obj.get('id','')}|{obj.get('uid','')}")
+        sys.exit(0)
+
+sys.exit(1)
+PY
+}
+
+# 出力デバイスを切り替え
+switch_audio_output() {
+    local device="$1"
+    if [ -z "$device" ]; then
+        return 1
+    fi
+    if command -v SwitchAudioSource >/dev/null 2>&1; then
+        if SwitchAudioSource -s "$device" -t output 2>/dev/null; then
+            log_message "Audio output switched to: $device"
+            return 0
+        fi
+        local record id uid
+        record="$(get_output_device_record_by_name "$device" || true)"
+        if [ -n "$record" ]; then
+            id="${record%%|*}"
+            uid="${record#*|}"
+            if [ -n "$uid" ] && SwitchAudioSource -u "$uid" -t output 2>/dev/null; then
+                log_message "Audio output switched to (uid): $device"
+                return 0
+            fi
+            if [ -n "$id" ] && SwitchAudioSource -i "$id" -t output 2>/dev/null; then
+                log_message "Audio output switched to (id): $device"
+                return 0
+            fi
+        fi
+        log_message "Failed to switch audio output to: $device"
+        return 1
+    fi
+    return 1
+}
+
+# 利用可能な出力デバイス一覧を取得
+get_available_output_devices() {
+    if command -v SwitchAudioSource >/dev/null 2>&1; then
+        SwitchAudioSource -a -t output 2>/dev/null || echo ""
+    else
+        echo ""
+    fi
+}
+
+# イヤホン系デバイスが接続されているかチェック（会議用デバイスは除外）
+is_earphone_connected() {
+    local devices
+    devices="$(get_available_output_devices)"
+    # 会議用デバイスを除外してからチェック
+    local filtered
+    filtered="$devices"
+    if [ -n "$MEETING_AUDIO_EARPHONE" ]; then
+        filtered="$(printf '%s\n' "$filtered" | grep -v -F "$MEETING_AUDIO_EARPHONE" || true)"
+    fi
+    if [ -n "$MEETING_AUDIO_SPEAKER" ]; then
+        filtered="$(printf '%s\n' "$filtered" | grep -v -F "$MEETING_AUDIO_SPEAKER" || true)"
+    fi
+    if echo "$filtered" | grep -qiE 'ヘッドフォン|イヤホン|AirPods|Headphone|Earphone'; then
+        return 0
+    fi
+    return 1
+}
+
+# デバイスが利用可能かチェック
+is_device_available() {
+    local device="$1"
+    local devices
+    devices="$(get_available_output_devices)"
+    if echo "$devices" | grep -qF "$device"; then
+        return 0
+    fi
+    return 1
+}
+
+is_meeting_output_device() {
+    local device="$1"
+    [ "$device" = "$MEETING_AUDIO_EARPHONE" ] || [ "$device" = "$MEETING_AUDIO_SPEAKER" ]
+}
+
+save_audio_output_backup() {
+    if [ -f "$AUDIO_BACKUP_FILE" ]; then
+        return 0
+    fi
+
+    local current
+    current="$(get_current_output_device)"
+    if [ -z "$current" ]; then
+        return 0
+    fi
+    if is_meeting_output_device "$current"; then
+        return 0
+    fi
+
+    echo "$current" > "$AUDIO_BACKUP_FILE"
+}
+
+ensure_meeting_audio_device() {
+    if [ "$MEETING_WEB_OUTPUT_AUTO_SWITCH" != "1" ]; then
+        return 0
+    fi
+    local current
+    current="$(get_current_output_device)"
+    local meeting_device
+    meeting_device="$(get_meeting_audio_device)"
+
+    if [ -z "$meeting_device" ]; then
+        return 0
+    fi
+    if [ "$current" = "$meeting_device" ]; then
+        return 0
+    fi
+
+    if ! is_meeting_output_device "$current"; then
+        save_audio_output_backup
+    fi
+
+    log_message "Meeting device update: ${current:-unknown} -> $meeting_device"
+    switch_audio_output "$meeting_device"
+}
+
+# 現在のデバイスに応じて会議用マルチ出力デバイスを選択
+get_meeting_audio_device() {
+    local current
+    current="$(get_current_output_device)"
+
+    if [ -n "$MEETING_WEB_OUTPUT_DEVICE" ] && [ "$MEETING_WEB_OUTPUT_DEVICE" != "auto" ]; then
+        echo "$MEETING_WEB_OUTPUT_DEVICE"
+        return 0
+    fi
+
+    # イヤホン系が接続されているかチェック
+    if is_earphone_connected; then
+        # イヤホン系デバイスを使用中、または会議用イヤホンを使用中
+        case "$current" in
+            *ヘッドフォン*|*イヤホン*|*AirPods*|*Headphone*|*Earphone*|"$MEETING_AUDIO_EARPHONE")
+                echo "$MEETING_AUDIO_EARPHONE"
+                return 0
+                ;;
+        esac
+    fi
+
+    # イヤホン未接続、またはスピーカー系を使用中
+    echo "$MEETING_AUDIO_SPEAKER"
+}
+
+# 会議開始時に出力デバイスを切り替え
+switch_to_meeting_audio() {
+    if [ "$MEETING_WEB_OUTPUT_AUTO_SWITCH" != "1" ]; then
+        log_message "Meeting audio auto switch disabled"
+        return 0
+    fi
+    local current
+    current="$(get_current_output_device)"
+    log_message "Meeting start - current output: $current"
+
+    # 適切な会議用デバイスを取得
+    local meeting_device
+    meeting_device="$(get_meeting_audio_device)"
+    log_message "Target meeting device: $meeting_device"
+
+    # すでに正しい会議用デバイスの場合は何もしない
+    if [ "$current" = "$meeting_device" ]; then
+        log_message "Already using correct meeting device"
+        return 0
+    fi
+
+    # 会議用デバイスだが間違ったものを使っている場合（イヤホン未接続で会議用イヤホンなど）
+    if [ "$current" = "$MEETING_AUDIO_EARPHONE" ] || [ "$current" = "$MEETING_AUDIO_SPEAKER" ]; then
+        log_message "Switching from wrong meeting device: $current -> $meeting_device"
+        # バックアップは作らない（元々会議用デバイスだったので）
+        switch_audio_output "$meeting_device"
+        return 0
+    fi
+
+    # 通常のデバイスから会議用デバイスへ切り替え
+    log_message "Saving backup: $current"
+    echo "$current" > "$AUDIO_BACKUP_FILE"
+
+    switch_audio_output "$meeting_device"
+    local updated
+    updated="$(get_current_output_device)"
+    if [ -n "$meeting_device" ] && [ "$updated" != "$meeting_device" ]; then
+        log_message "Warning: meeting output switch failed (current=${updated:-unknown}, target=$meeting_device)"
+    fi
+}
+
+# 会議終了時に元のデバイスに戻す
+restore_audio_output() {
+    local current
+    current="$(get_current_output_device)"
+    log_message "Meeting end - current output: $current"
+
+    # 会議用デバイス以外なら何もしない
+    if [ "$current" != "$MEETING_AUDIO_EARPHONE" ] && [ "$current" != "$MEETING_AUDIO_SPEAKER" ]; then
+        log_message "Not using meeting device, no restore needed"
+        rm -f "$AUDIO_BACKUP_FILE"
+        return 0
+    fi
+
+    # バックアップがあれば元に戻す
+    if [ -f "$AUDIO_BACKUP_FILE" ]; then
+        local original
+        original="$(cat "$AUDIO_BACKUP_FILE" 2>/dev/null || true)"
+        rm -f "$AUDIO_BACKUP_FILE"
+        if [ -n "$original" ] && is_device_available "$original"; then
+            log_message "Restoring to backup device: $original"
+            switch_audio_output "$original"
+            return 0
+        fi
+        log_message "Backup device not available: $original"
+    fi
+
+    # バックアップがない、または元デバイスが利用不可の場合はデフォルトに戻す
+    log_message "Restoring to default device: $DEFAULT_OUTPUT_DEVICE"
+    switch_audio_output "$DEFAULT_OUTPUT_DEVICE"
+}
+
+warn_multisoundchanger() {
+    if [ "$MEETING_MULTI_SOUND_CHANGER_CHECK" != "1" ]; then
+        return 0
+    fi
+    if [ ! -d "$MEETING_MULTI_SOUND_CHANGER_APP" ]; then
+        log_message "Warning: MultiSoundChanger app not found (${MEETING_MULTI_SOUND_CHANGER_APP})"
+        return 0
+    fi
+    if ! pgrep -f "MultiSoundChanger" >/dev/null 2>&1; then
+        log_message "Warning: MultiSoundChanger not running"
+    fi
+}
+
+
+stop_auto_recording() {
+    local reason="${1:-unknown}"
+    local platform
+    platform="$(get_recording_meta platform)"
+    local source
+    source="$(get_recording_meta source)"
+    if [ "$source" != "auto" ]; then
+        log_message "Stop skipped (source=$source, reason=$reason)"
+        return 0
+    fi
+    log_message "Stopping auto recording (reason=$reason, platform=$platform)"
+    "$MEETING_BIN" stop || true
+}
+
+MISS_LIMIT="${MEETING_WATCH_MISS_LIMIT:-3}"
+MIN_DURATION_SEC="${MEETING_WATCH_MIN_DURATION:-120}"
+
+trim_text() {
+    printf '%s' "$1" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+}
+
+clean_meet_title() {
+    local title
+    title="$(trim_text "$1")"
+    title="$(printf '%s' "$title" | sed -E 's/[[:space:]]*[-–][[:space:]]*Google Meet$//')"
+    trim_text "$title"
+}
+
+clean_zoom_title() {
+    local title
+    title="$(trim_text "$1")"
+    local cleaned
+    cleaned="$(printf '%s' "$title" | sed -E 's/[[:space:]]*[-–][[:space:]]*Zoom Meeting$//; s/[[:space:]]*[-–][[:space:]]*Zoom$//')"
+    cleaned="$(trim_text "$cleaned")"
+    if [ -z "$cleaned" ]; then
+        cleaned="$title"
+    fi
+    printf '%s' "$cleaned"
+}
+
+detect_meet() {
+    local raw
+    raw="$(osascript << 'APPLESCRIPT' 2>/dev/null || true
+if application "Google Chrome" is running then
+    tell application "Google Chrome"
+        set output to ""
+        repeat with w in windows
+            repeat with t in tabs of w
+                try
+                    set theUrl to URL of t
+                    if theUrl starts with "https://meet.google.com/" then
+                        set output to output & (title of t) & "||" & theUrl & linefeed
+                    end if
+                end try
+            end repeat
+        end repeat
+        return output
+    end tell
+end if
+APPLESCRIPT
+)"
+
+    local line
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        local title="${line%%||*}"
+        local url="${line#*||}"
+        if [[ "$url" =~ ^https://meet\.google\.com/[a-z0-9]{3}-[a-z0-9]{4}-[a-z0-9]{3} ]]; then
+            title="$(clean_meet_title "$title")"
+            printf '%s|%s' "$title" "$url"
+            return 0
+        fi
+    done <<< "$raw"
+    return 1
+}
+
+detect_zoom() {
+    local raw
+    raw="$(osascript << 'APPLESCRIPT' 2>/dev/null || true
+if application "zoom.us" is running then
+    tell application "System Events" to tell process "zoom.us"
+        set output to ""
+        repeat with w in windows
+            set output to output & (name of w) & linefeed
+        end repeat
+        return output
+    end tell
+end if
+APPLESCRIPT
+)"
+
+    local title
+    while IFS= read -r title; do
+        title="$(trim_text "$title")"
+        [ -z "$title" ] && continue
+        case "$title" in
+            "Zoom"|"Zoom Workplace"|"Zoom Meetings"|"Home"|"Contacts"|"Chats"|"Meetings"|"Settings"|"Preferences"|"Join Meeting"|"Schedule Meeting")
+                continue
+                ;;
+        esac
+        printf '%s' "$(clean_zoom_title "$title")"
+        return 0
+    done <<< "$raw"
+    return 1
+}
+
+clean_teams_title() {
+    local title
+    title="$(trim_text "$1")"
+    # "| Microsoft Teams" を除去
+    title="$(printf '%s' "$title" | sed -E 's/[[:space:]]*\|[[:space:]]*Microsoft Teams$//')"
+    trim_text "$title"
+}
+
+detect_teams() {
+    # 1. まずTeamsデスクトップアプリをチェック
+    local app_title
+    app_title="$(detect_teams_app || true)"
+    if [ -n "$app_title" ]; then
+        printf '%s' "$app_title"
+        return 0
+    fi
+
+    # 2. Chromeでteams.microsoft.comを開いている場合
+    local raw
+    raw="$(osascript << 'APPLESCRIPT' 2>/dev/null || true
+if application "Google Chrome" is running then
+    tell application "Google Chrome"
+        set output to ""
+        repeat with w in windows
+            repeat with t in tabs of w
+                set theUrl to URL of t
+                if theUrl starts with "https://teams.microsoft.com/" then
+                    set output to output & (title of t) & "||" & theUrl & linefeed
+                end if
+            end repeat
+        end repeat
+        return output
+    end tell
+end if
+APPLESCRIPT
+)"
+
+    local line
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        local title="${line%%||*}"
+        local url="${line#*||}"
+        # 会議中のURL（meetup-join, meet, v2）を検知
+        if [[ "$url" =~ teams\.microsoft\.com/(l/meetup-join|meet|v2) ]]; then
+            title="$(clean_teams_title "$title")"
+            printf '%s|%s' "$title" "$url"
+            return 0
+        fi
+    done <<< "$raw"
+    return 1
+}
+
+# Teamsデスクトップアプリの会議を検知
+detect_teams_app() {
+    local raw
+    raw="$(osascript << 'APPLESCRIPT' 2>/dev/null || true
+if application "Microsoft Teams" is running then
+    tell application "System Events" to tell process "Microsoft Teams"
+        set output to ""
+        repeat with w in windows
+            set output to output & (name of w) & linefeed
+        end repeat
+        return output
+    end tell
+end if
+APPLESCRIPT
+)"
+
+    local title
+    while IFS= read -r title; do
+        title="$(trim_text "$title")"
+        [ -z "$title" ] && continue
+        # 非会議ウィンドウを除外
+        case "$title" in
+            "Microsoft Teams"|"Teams"|""|"Chat"|"Calendar"|"Activity"|"Files"|"Apps"|"Help"|"Settings"|"Calls"|"Notifications")
+                continue
+                ;;
+        esac
+        # 会議ウィンドウの特徴: 「| Microsoft Teams」で終わる、または会議名が含まれる
+        # 「通話中」「Meeting」などのキーワードがあれば会議中と判定
+        if [[ "$title" =~ (通話|Meeting|ミーティング|会議|\|) ]]; then
+            title="$(clean_teams_title "$title")"
+            printf '%s' "$title"
+            return 0
+        fi
+    done <<< "$raw"
+    return 1
+}
+
+is_recording_active() {
+    if [ -f "$PID_FILE" ]; then
+        local pid
+        pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+        if [ -n "$pid" ] && ps -p "$pid" > /dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+get_recording_meta() {
+    local field="${1:-source}"
+    if [ ! -f "$INFO_FILE" ]; then
+        printf '%s' "manual"
+        return 0
+    fi
+    local info
+    info="$(cat "$INFO_FILE" 2>/dev/null || true)"
+    local filename="" meeting_name="" category="" source="" platform="" storage_area="" project_name=""
+    IFS='|' read -r filename meeting_name category source platform storage_area project_name <<< "$info"
+    case "$field" in
+        platform)
+            printf '%s' "${platform:-unknown}"
+            ;;
+        *)
+            printf '%s' "${source:-manual}"
+            ;;
+    esac
+}
+
+get_recording_started_at() {
+    if [ -f "$INFO_FILE" ]; then
+        stat -f %m "$INFO_FILE" 2>/dev/null || true
+    fi
+}
+
+start_meeting() {
+    local platform="$1"
+    local title="$2"
+    local url="${3:-}"
+    title="$(trim_text "$title")"
+    if [ -z "$title" ]; then
+        title="無題"
+    fi
+    if is_recording_active; then
+        local existing_source
+        existing_source="$(get_recording_meta source)"
+        log_message "Skip auto start: already recording (source=$existing_source)"
+        return 0
+    fi
+
+    local args=("$MEETING_BIN" start "$title" --auto --web --platform "$platform")
+
+    if [ -n "${MEETING_WATCH_SIDE_BUSINESS:-}" ]; then
+        args+=(--side-business "$MEETING_WATCH_SIDE_BUSINESS")
+    fi
+
+    if [ -n "${MEETING_WATCH_ACTIVITY:-}" ]; then
+        args+=(--activity)
+    fi
+
+    if [ -n "$url" ]; then
+        log_message "Auto meeting detected: platform=$platform title=$title url=$url"
+    else
+        log_message "Auto meeting detected: platform=$platform title=$title"
+    fi
+
+    # 会議用出力デバイスに切り替え
+    switch_to_meeting_audio
+    warn_multisoundchanger
+    if ! ls /Library/Audio/Plug-Ins/HAL/ 2>/dev/null | grep -qi blackhole; then
+        log_message "Warning: BlackHole not found; web audio may be missing"
+    fi
+
+    "${args[@]}" || true
+}
+
+if [ ! -x "$MEETING_BIN" ]; then
+    echo "Error: meeting tool not found at $MEETING_BIN" >&2
+    exit 1
+fi
+
+log_message "Watch started (pid=$$)"
+log_message "Log retention days: $LOG_RETENTION_DAYS"
+log_message "Poll interval: ${POLL_INTERVAL}s, miss_limit=${MISS_LIMIT}, min_duration=${MIN_DURATION_SEC}"
+log_message "SwitchAudioSource available: $([ -x \"$(command -v SwitchAudioSource 2>/dev/null)\" ] && echo 'yes' || echo 'no')"
+log_message "MEETING_WEB_OUTPUT_DEVICE=${MEETING_WEB_OUTPUT_DEVICE:-unset}"
+log_message "MEETING_WEB_OUTPUT_AUTO_SWITCH=${MEETING_WEB_OUTPUT_AUTO_SWITCH:-unset}"
+log_message "MEETING_WEB_INPUT_DEVICE=${MEETING_WEB_INPUT_DEVICE:-unset}"
+log_message "MEETING_WEB_MIC_DEVICE=${MEETING_WEB_MIC_DEVICE:-unset}"
+log_message "MEETING_WEB_MIC_DEVICE_EARPHONE=${MEETING_WEB_MIC_DEVICE_EARPHONE:-unset}"
+log_message "MEETING_WEB_INPUT_MODE=${MEETING_WEB_INPUT_MODE:-unset}"
+log_message "MEETING_WEB_INPUT_GAIN_BLACKHOLE=${MEETING_WEB_INPUT_GAIN_BLACKHOLE:-unset} MEETING_WEB_INPUT_GAIN_MIC=${MEETING_WEB_INPUT_GAIN_MIC:-unset}"
+log_message "MEETING_WEB_AUTO_LEVEL=${MEETING_WEB_AUTO_LEVEL:-unset} MEETING_WEB_LIMITER=${MEETING_WEB_LIMITER:-unset} MEETING_WEB_MIX_NORMALIZE=${MEETING_WEB_MIX_NORMALIZE:-unset}"
+log_message "MEETING_KEEP_AUDIO=${MEETING_KEEP_AUDIO:-unset} MEETING_WATCH_KEEP_AUDIO=${MEETING_WATCH_KEEP_AUDIO:-unset}"
+log_message "HOME=$HOME"
+log_message "Codex path: $HOME/.nvm/versions/node/v20.19.4/bin/codex exists: $([ -x "$HOME/.nvm/versions/node/v20.19.4/bin/codex" ] && echo 'yes' || echo 'no')"
+available_output_devices="$(get_available_output_devices)"
+if [ -z "$available_output_devices" ]; then
+    log_message "Available output devices: (empty)"
+else
+    log_message "Available output devices: $(printf '%s' "$available_output_devices" | tr '\n' ', ')"
+fi
+log_message "Current output: $(get_current_output_device)"
+log_message "Earphone connected: $(is_earphone_connected && echo 'yes' || echo 'no')"
+
+miss_count=0
+while true; do
+    meet_info="$(detect_meet || true)"
+    local_meet_title=""
+    local_meet_url=""
+    if [ -n "$meet_info" ]; then
+        local_meet_title="${meet_info%%|*}"
+        local_meet_url="${meet_info#*|}"
+    fi
+
+    zoom_title="$(detect_zoom || true)"
+
+    teams_info="$(detect_teams || true)"
+    local_teams_title=""
+    local_teams_url=""
+    if [ -n "$teams_info" ]; then
+        local_teams_title="${teams_info%%|*}"
+        local_teams_url="${teams_info#*|}"
+    fi
+
+    if is_recording_active; then
+        source="$(get_recording_meta source)"
+        platform="$(get_recording_meta platform)"
+    if [ "$source" != "auto" ]; then
+        miss_count=0
+    else
+        ensure_meeting_audio_device
+        active="no"
+        case "$platform" in
+            meet)
+                [ -n "$local_meet_title" ] && active="yes"
+                    ;;
+                zoom)
+                    [ -n "$zoom_title" ] && active="yes"
+                    ;;
+                teams)
+                    [ -n "$local_teams_title" ] && active="yes"
+                    ;;
+                *)
+                    if [ -n "$local_meet_title" ] || [ -n "$zoom_title" ] || [ -n "$local_teams_title" ]; then
+                        active="yes"
+                    fi
+                    ;;
+            esac
+
+            if [ "$active" = "yes" ]; then
+                miss_count=0
+            else
+                miss_count=$((miss_count + 1))
+                log_message "Meeting not detected, miss_count=$miss_count/$MISS_LIMIT"
+            fi
+
+            if [ "$miss_count" -ge "$MISS_LIMIT" ]; then
+                if [ "$MIN_DURATION_SEC" -gt 0 ]; then
+                    started_at="$(get_recording_started_at)"
+                    if [ -n "$started_at" ]; then
+                        now="$(date +%s)"
+                        elapsed=$((now - started_at))
+                        if [ "$elapsed" -lt "$MIN_DURATION_SEC" ]; then
+                            log_message "Miss limit reached but within min duration (${elapsed}s < ${MIN_DURATION_SEC}s), keep recording"
+                            miss_count=0
+                        else
+                            log_message "Miss limit reached, stopping recording..."
+                            # 即座に「会議が終わりました」通知を送信
+                            stop_auto_recording "miss_limit"
+                            miss_count=0
+                        fi
+                    else
+                        log_message "Miss limit reached, stopping recording..."
+                        # 即座に「会議が終わりました」通知を送信
+                        stop_auto_recording "miss_limit"
+                        miss_count=0
+                    fi
+                else
+                    log_message "Miss limit reached, stopping recording..."
+                    # 即座に「会議が終わりました」通知を送信
+                    stop_auto_recording "miss_limit"
+                    miss_count=0
+                fi
+            fi
+        fi
+    else
+        miss_count=0
+        if [ -n "$local_meet_title" ]; then
+            start_meeting "meet" "$local_meet_title" "$local_meet_url"
+        elif [ -n "$zoom_title" ]; then
+            start_meeting "zoom" "$zoom_title"
+        elif [ -n "$local_teams_title" ]; then
+            start_meeting "teams" "$local_teams_title" "$local_teams_url"
+        fi
+    fi
+
+    sleep "$POLL_INTERVAL"
+done

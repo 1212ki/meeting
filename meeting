@@ -1,0 +1,2836 @@
+#!/bin/bash
+
+# ====================================
+# Meeting Recording Tool
+# ====================================
+# 使い方:
+#   ./meeting start "会議名" --商談                        - 商談の録音開始
+#   ./meeting start "会議名" --社内                        - 社内会議の録音開始
+#   ./meeting start "会議名" --プライベート                - プライベートの録音開始
+#   ./meeting start "会議名" --side-business               - 個人事業の録音開始
+#   ./meeting start "会議名" --activity                    - 活動の録音開始
+#   ./meeting start "会議名" --thoughts                    - 思想の録音開始
+#   ./meeting start "会議名" --life                        - 日常の録音開始
+#   ./meeting start "会議名" --商談 --web                  - WEB商談の録音開始
+#   ./meeting start "会議名" --プライベート --side-business kondate-loop --web
+#                                                   - 個人事業のWEB会議を録音開始
+#   ./meeting start "会議名" --auto --web                  - 自動判定の録音開始
+#   ./meeting stop                          - 録音停止 → 文字起こし → メモ生成
+#   ./meeting list                          - 録音一覧
+#   ./meeting reprocess transcript.txt      - 既存文字起こしの再処理
+# ====================================
+
+# 保存先ディレクトリ
+BASE_DIR="/Users/itsuki.matsumoto/claude-code/knowledge/meetings"
+PRIVATE_DIR="/Users/itsuki.matsumoto/claude-code/knowledge/meetings/private"
+ACTIVITIES_DIR="/Users/itsuki.matsumoto/claude-code/knowledge/meetings/activities"
+PRIVATE_THOUGHTS_DIR="/Users/itsuki.matsumoto/claude-code/knowledge/meetings/thoughts"
+PRIVATE_LIFE_DIR="/Users/itsuki.matsumoto/claude-code/knowledge/meetings/life"
+SIDE_BUSINESS_DIR="/Users/itsuki.matsumoto/claude-code/knowledge/meetings/side-business"
+PRODUCTS_DIR="/Users/itsuki.matsumoto/claude-code/knowledge/products"
+ITSUKI_TRAITS_FILE="/Users/itsuki.matsumoto/claude-code/knowledge/notes/itsuki-traits.md"
+THOUGHTS_DIR="/Users/itsuki.matsumoto/claude-code/knowledge/private/thoughts"
+REGULAR_MEETINGS_FILE="/Users/itsuki.matsumoto/claude-code/tools/meeting/regular-meetings.tsv"
+TEMP_DIR="/Users/itsuki.matsumoto/claude-code/knowledge/meetings/_audio"  # 一時ファイル用
+KEEP_AUDIO="${MEETING_KEEP_AUDIO:-0}"
+MEETING_DELETE_AUDIO_ON_SHORT="${MEETING_DELETE_AUDIO_ON_SHORT:-0}"
+PID_FILE="$TEMP_DIR/.recording.pid"
+INFO_FILE="$TEMP_DIR/.recording.info"
+WHISPER_PATH="$HOME/Library/Python/3.9/bin/whisper"
+AUTO_CATEGORY="自動"
+PRIVATE_CATEGORY="プライベート"
+STORAGE_MODE="${MEETING_STORAGE_MODE:-auto}"
+
+# 色付け
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# オーディオ設定
+AUDIO_BACKUP_FILE="$TEMP_DIR/.audio_output_backup"
+OUTPUT_WATCH_PID_FILE="$TEMP_DIR/.output_watch.pid"
+OUTPUT_WATCH_INTERVAL="${MEETING_OUTPUT_WATCH_INTERVAL:-5}"
+DEFAULT_OUTPUT_DEVICE="MacBook Airのスピーカー"
+MEETING_MULTI_SOUND_CHANGER_APP="${MEETING_MULTI_SOUND_CHANGER_APP:-/Applications/MultiSoundChanger.app}"
+MEETING_MULTI_SOUND_CHANGER_CHECK="${MEETING_MULTI_SOUND_CHANGER_CHECK:-1}"
+# WEB会議用の出力デバイス自動切替
+MEETING_AUDIO_EARPHONE="${MEETING_AUDIO_EARPHONE:-会議用イヤホン}"
+MEETING_AUDIO_SPEAKER="${MEETING_AUDIO_SPEAKER:-会議用スピーカー}"
+MEETING_WEB_OUTPUT_DEVICE="${MEETING_WEB_OUTPUT_DEVICE:-auto}"
+MEETING_WEB_OUTPUT_AUTO_SWITCH="${MEETING_WEB_OUTPUT_AUTO_SWITCH:-1}"
+MEETING_WEB_INPUT_MODE="${MEETING_WEB_INPUT_MODE:-mix}"
+MEETING_WEB_MIC_DEVICE="${MEETING_WEB_MIC_DEVICE:-}"
+MEETING_WEB_MIC_DEVICE_EARPHONE="${MEETING_WEB_MIC_DEVICE_EARPHONE:-}"
+MEETING_WEB_INPUT_GAIN_BLACKHOLE="${MEETING_WEB_INPUT_GAIN_BLACKHOLE:-1.5}"
+MEETING_WEB_INPUT_GAIN_MIC="${MEETING_WEB_INPUT_GAIN_MIC:-1.5}"
+MEETING_WEB_MIX_NORMALIZE="${MEETING_WEB_MIX_NORMALIZE:-1}"
+MEETING_WEB_AUTO_LEVEL="${MEETING_WEB_AUTO_LEVEL:-1}"
+MEETING_WEB_AUTO_LEVEL_FILTER="${MEETING_WEB_AUTO_LEVEL_FILTER:-dynaudnorm=f=200:g=10}"
+MEETING_WEB_LIMITER="${MEETING_WEB_LIMITER:-1}"
+MEETING_WEB_LIMITER_FILTER="${MEETING_WEB_LIMITER_FILTER:-alimiter=limit=0.9}"
+
+# ログ設定
+LOG_DIR="/Users/itsuki.matsumoto/claude-code/knowledge/meetings/log"
+MEETING_LOG_RETENTION_DAYS="${MEETING_LOG_RETENTION_DAYS:-14}"
+MEETING_LOG_DATE=""
+MEETING_LOG_FILE=""
+LAST_MEETING_MD_FILE=""
+LAST_MEETING_SUMMARY=""
+LAST_MEETING_SUMMARY_GENERATED=0
+LAST_MEETING_SUMMARY_STATUS=""
+
+cleanup_old_meeting_logs() {
+    find "$LOG_DIR" -maxdepth 1 -type f -name 'meeting-*.log' -mtime "+$MEETING_LOG_RETENTION_DAYS" -delete 2>/dev/null || true
+}
+
+ensure_meeting_log_file() {
+    local today
+    today="$(date '+%Y-%m-%d')"
+    if [ "$MEETING_LOG_DATE" != "$today" ]; then
+        MEETING_LOG_DATE="$today"
+        MEETING_LOG_FILE="$LOG_DIR/meeting-$MEETING_LOG_DATE.log"
+        mkdir -p "$LOG_DIR"
+        cleanup_old_meeting_logs
+    fi
+}
+
+meeting_log() {
+    local timestamp
+    ensure_meeting_log_file
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+    printf '[%s] %s\n' "$timestamp" "$*" >> "$MEETING_LOG_FILE"
+}
+
+AVFOUNDATION_DEVICES_CACHE=""
+
+get_avfoundation_devices_output() {
+    if [ -n "$AVFOUNDATION_DEVICES_CACHE" ]; then
+        printf '%s' "$AVFOUNDATION_DEVICES_CACHE"
+        return 0
+    fi
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        return 1
+    fi
+    AVFOUNDATION_DEVICES_CACHE="$(ffmpeg -f avfoundation -list_devices true -i "" 2>&1 || true)"
+    printf '%s' "$AVFOUNDATION_DEVICES_CACHE"
+}
+
+log_avfoundation_devices() {
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        meeting_log "avfoundation devices: ffmpeg not found"
+        return 0
+    fi
+
+    local output
+    output="$(get_avfoundation_devices_output)"
+    if [ -z "$output" ]; then
+        meeting_log "avfoundation devices: no output"
+        return 0
+    fi
+
+    meeting_log "avfoundation devices: begin"
+    while IFS= read -r line; do
+        meeting_log "avfoundation: $line"
+    done <<< "$output"
+    meeting_log "avfoundation devices: end"
+}
+
+resolve_avfoundation_audio_index() {
+    local target="$1"
+    if [ -z "$target" ]; then
+        return 1
+    fi
+    if printf '%s' "$target" | grep -qE '^[0-9]+$'; then
+        printf '%s' "$target"
+        return 0
+    fi
+
+    local output
+    output="$(get_avfoundation_devices_output)"
+    if [ -z "$output" ]; then
+        return 1
+    fi
+
+    local index
+    index="$(printf '%s\n' "$output" | awk -v target="$target" '
+        BEGIN { in_audio = 0 }
+        /AVFoundation audio devices:/ { in_audio = 1; next }
+        /AVFoundation video devices:/ { in_audio = 0; next }
+        in_audio {
+            if (match($0, /\[[0-9]+\][[:space:]]+/)) {
+                line = $0
+                sub(/.*\[[0-9]+\][[:space:]]+/, "", line)
+                if (line == target) {
+                    match($0, /\[[0-9]+\]/)
+                    idx = substr($0, RSTART + 1, RLENGTH - 2)
+                    print idx
+                    exit
+                }
+            }
+        }
+    ')"
+    if [ -n "$index" ]; then
+        printf '%s' "$index"
+        return 0
+    fi
+    return 1
+}
+
+# ディレクトリ確認
+mkdir -p "$TEMP_DIR"
+mkdir -p "$BASE_DIR"
+mkdir -p "$BASE_DIR/商談"
+mkdir -p "$BASE_DIR/社内"
+mkdir -p "$PRIVATE_DIR"
+mkdir -p "$ACTIVITIES_DIR"
+mkdir -p "$PRIVATE_THOUGHTS_DIR"
+mkdir -p "$PRIVATE_LIFE_DIR"
+mkdir -p "$SIDE_BUSINESS_DIR"
+
+# ヘルプ表示
+show_help() {
+    echo "Meeting Recording Tool"
+    echo ""
+    echo "使い方:"
+    echo "  meeting start \"会議名\" --商談        商談の録音開始"
+    echo "  meeting start \"会議名\" --社内        社内会議の録音開始"
+    echo "  meeting start \"会議名\" --プライベート        プライベートの録音開始"
+    echo "  meeting start \"会議名\" --side-business       個人事業の録音開始"
+    echo "  meeting start \"会議名\" --activity            活動の録音開始"
+    echo "  meeting start \"会議名\" --thoughts            思想の録音開始"
+    echo "  meeting start \"会議名\" --life                日常の録音開始"
+    echo "  meeting start \"会議名\" --商談 --web  WEB商談の録音"
+    echo "  meeting start \"会議名\" --プライベート --side-business kondate-loop --web"
+    echo "                                      個人事業のWEB会議を録音"
+    echo "  meeting start \"会議名\" --auto --web  自動判定用（タイトル/カテゴリ後付け）"
+    echo "  meeting stop                          録音停止 → 文字起こし"
+    echo "  meeting list                          録音一覧を表示"
+    echo "  meeting reprocess <transcript.txt>    既存文字起こしの再処理"
+    echo "    オプション: --md <path> --title <title> --date YYYY-MM-DD --replace"
+    echo ""
+    echo "例:"
+    echo "  meeting start \"A社プレゼン\" --商談"
+    echo "  meeting start \"週次定例\" --社内"
+    echo "  meeting start \"家族打ち合わせ\" --プライベート"
+    echo "  meeting start \"Kondate Loop\" --side-business"
+    echo "  meeting start \"B社Zoom\" --商談 --web"
+    echo "  meeting stop"
+    echo ""
+    echo "保存先:"
+    echo "  商談: $BASE_DIR/商談/"
+    echo "  社内: $BASE_DIR/社内/"
+    echo "  未分類: $BASE_DIR/"
+    echo "  プライベート: $PRIVATE_DIR/"
+    echo "  表現活動: $ACTIVITIES_DIR/"
+    echo "  思想: $PRIVATE_THOUGHTS_DIR/"
+    echo "  日常: $PRIVATE_LIFE_DIR/"
+    echo "  個人事業: $SIDE_BUSINESS_DIR/"
+}
+
+# 既定の入力デバイス名を取得
+get_default_audio_device() {
+    local device=""
+
+    if command -v SwitchAudioSource >/dev/null 2>&1; then
+        device=$(SwitchAudioSource -t input -c 2>/dev/null)
+    fi
+
+    if [ -z "$device" ]; then
+        device=$(system_profiler SPAudioDataType 2>/dev/null | awk '
+            /^[[:space:]]+[^:]+:$/ {
+                name=$0
+                sub(/^[[:space:]]+/, "", name)
+                sub(/:$/, "", name)
+            }
+            /Default Input Device: Yes/ {
+                print name
+                exit
+            }
+        ')
+    fi
+
+    echo "$device"
+}
+
+get_default_output_device() {
+    local device=""
+
+    device=$(system_profiler SPAudioDataType 2>/dev/null | awk '
+        /^[[:space:]]+[^:]+:$/ {
+            name=$0
+            sub(/^[[:space:]]+/, "", name)
+            sub(/:$/, "", name)
+        }
+        /Default Output Device: Yes/ {
+            print name
+            exit
+        }
+    ')
+
+    echo "$device"
+}
+
+get_available_output_devices() {
+    if command -v SwitchAudioSource >/dev/null 2>&1; then
+        SwitchAudioSource -a -t output 2>/dev/null || true
+    fi
+}
+
+is_earphone_connected() {
+    local devices
+    devices="$(get_available_output_devices)"
+    if [ -n "$devices" ]; then
+        local filtered
+        filtered="$devices"
+        if [ -n "$MEETING_AUDIO_EARPHONE" ]; then
+            filtered="$(printf '%s\n' "$filtered" | grep -v -F "$MEETING_AUDIO_EARPHONE" || true)"
+        fi
+        if [ -n "$MEETING_AUDIO_SPEAKER" ]; then
+            filtered="$(printf '%s\n' "$filtered" | grep -v -F "$MEETING_AUDIO_SPEAKER" || true)"
+        fi
+        if printf '%s\n' "$filtered" | grep -qiE 'ヘッドフォン|イヤホン|AirPods|Headphone|Earphone'; then
+            return 0
+        fi
+        return 1
+    fi
+
+    local current
+    current="$(get_default_output_device)"
+    if printf '%s' "$current" | grep -qiE 'ヘッドフォン|イヤホン|AirPods|Headphone|Earphone'; then
+        return 0
+    fi
+    return 1
+}
+
+get_current_output_device() {
+    local device=""
+
+    if command -v SwitchAudioSource >/dev/null 2>&1; then
+        device="$(SwitchAudioSource -c -t output -f human 2>/dev/null || true)"
+    fi
+
+    if [ -z "$device" ]; then
+        device="$(get_default_output_device)"
+    fi
+
+    printf '%s' "$device"
+}
+
+get_output_device_record_by_name() {
+    local target="$1"
+    if [ -z "$target" ]; then
+        return 1
+    fi
+    if ! command -v SwitchAudioSource >/dev/null 2>&1; then
+        return 1
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        return 1
+    fi
+    python3 - "$target" << 'PY'
+import json
+import subprocess
+import sys
+
+target = sys.argv[1]
+try:
+    output = subprocess.check_output(
+        ["SwitchAudioSource", "-a", "-t", "output", "-f", "json"],
+        stderr=subprocess.STDOUT,
+    )
+except Exception:
+    sys.exit(1)
+
+for line in output.decode("utf-8", errors="ignore").splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+    except Exception:
+        continue
+    if obj.get("name") == target:
+        print(f"{obj.get('id','')}|{obj.get('uid','')}")
+        sys.exit(0)
+
+sys.exit(1)
+PY
+}
+
+switch_audio_output() {
+    local device="$1"
+    if [ -z "$device" ]; then
+        return 1
+    fi
+    if ! command -v SwitchAudioSource >/dev/null 2>&1; then
+        return 1
+    fi
+    if SwitchAudioSource -s "$device" -t output >/dev/null 2>&1; then
+        meeting_log "Audio output switched to: $device"
+        return 0
+    fi
+
+    local record id uid
+    record="$(get_output_device_record_by_name "$device" || true)"
+    if [ -n "$record" ]; then
+        id="${record%%|*}"
+        uid="${record#*|}"
+        if [ -n "$uid" ] && SwitchAudioSource -u "$uid" -t output >/dev/null 2>&1; then
+            meeting_log "Audio output switched to (uid): $device"
+            return 0
+        fi
+        if [ -n "$id" ] && SwitchAudioSource -i "$id" -t output >/dev/null 2>&1; then
+            meeting_log "Audio output switched to (id): $device"
+            return 0
+        fi
+    fi
+    meeting_log "Failed to switch audio output to: $device"
+    return 1
+}
+
+is_meeting_output_device() {
+    local device="$1"
+    [ "$device" = "$MEETING_AUDIO_EARPHONE" ] || [ "$device" = "$MEETING_AUDIO_SPEAKER" ]
+}
+
+pick_non_meeting_earphone_device() {
+    local devices
+    devices="$(get_available_output_devices)"
+    if [ -z "$devices" ]; then
+        return 1
+    fi
+    printf '%s\n' "$devices" \
+        | grep -v "^会議用" \
+        | grep -iE 'ヘッドフォン|イヤホン|AirPods|Headphone|Earphone' \
+        | head -n 1
+}
+
+save_audio_output_backup() {
+    if [ -f "$AUDIO_BACKUP_FILE" ]; then
+        return 0
+    fi
+
+    local current
+    current="$(get_current_output_device)"
+    if [ -z "$current" ]; then
+        return 0
+    fi
+    if is_meeting_output_device "$current"; then
+        return 0
+    fi
+
+    printf '%s' "$current" > "$AUDIO_BACKUP_FILE"
+}
+
+resolve_fallback_output_device() {
+    local fallback
+    fallback="$(pick_non_meeting_earphone_device || true)"
+    if [ -n "$fallback" ]; then
+        printf '%s' "$fallback"
+        return 0
+    fi
+
+    if audio_device_exists "$DEFAULT_OUTPUT_DEVICE"; then
+        printf '%s' "$DEFAULT_OUTPUT_DEVICE"
+        return 0
+    fi
+
+    printf '%s' "$(get_default_output_device)"
+}
+
+# 会議終了時に出力デバイスを元に戻す
+restore_audio_output() {
+    if ! command -v SwitchAudioSource >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local current
+    current="$(get_current_output_device)"
+    if ! is_meeting_output_device "$current"; then
+        rm -f "$AUDIO_BACKUP_FILE"
+        return 0
+    fi
+
+    # バックアップがあれば元に戻す
+    if [ -f "$AUDIO_BACKUP_FILE" ]; then
+        local original
+        original="$(cat "$AUDIO_BACKUP_FILE" 2>/dev/null || true)"
+        rm -f "$AUDIO_BACKUP_FILE"
+        if [ -n "$original" ] && audio_device_exists "$original"; then
+            if switch_audio_output "$original"; then
+                echo -e "${GREEN}出力デバイスを復元しました: $original${NC}"
+                return 0
+            fi
+        fi
+    fi
+
+    # バックアップがなければデフォルトに戻す
+    local fallback
+    fallback="$(resolve_fallback_output_device)"
+    if [ -n "$fallback" ]; then
+        switch_audio_output "$fallback" || true
+        echo -e "${GREEN}出力デバイスをデフォルトに戻しました: $fallback${NC}"
+    fi
+}
+
+audio_device_exists() {
+    local target="$1"
+    if [ -z "$target" ]; then
+        return 1
+    fi
+    system_profiler SPAudioDataType 2>/dev/null | awk -v target="$target" '
+        /^[[:space:]]+[^:]+:$/ {
+            name=$0
+            sub(/^[[:space:]]+/, "", name)
+            sub(/:$/, "", name)
+            if (name == target) {
+                found=1
+            }
+        }
+        END { exit(found ? 0 : 1) }
+    '
+}
+
+resolve_web_output_device() {
+    local requested="${MEETING_WEB_OUTPUT_DEVICE:-auto}"
+
+    if [ -n "$requested" ] && [ "$requested" != "auto" ]; then
+        printf '%s' "$requested"
+        return 0
+    fi
+
+    if is_earphone_connected && audio_device_exists "$MEETING_AUDIO_EARPHONE"; then
+        printf '%s' "$MEETING_AUDIO_EARPHONE"
+        return 0
+    fi
+
+    if audio_device_exists "$MEETING_AUDIO_SPEAKER"; then
+        printf '%s' "$MEETING_AUDIO_SPEAKER"
+        return 0
+    fi
+
+    printf '%s' "$(get_default_output_device)"
+}
+
+is_output_watch_running() {
+    if [ -f "$OUTPUT_WATCH_PID_FILE" ]; then
+        local pid
+        pid="$(cat "$OUTPUT_WATCH_PID_FILE" 2>/dev/null || true)"
+        if [ -n "$pid" ] && ps -p "$pid" > /dev/null 2>&1; then
+            return 0
+        fi
+        rm -f "$OUTPUT_WATCH_PID_FILE"
+    fi
+    return 1
+}
+
+start_output_watch() {
+    if [ "${MEETING_WEB_OUTPUT_AUTO_SWITCH:-0}" != "1" ]; then
+        return 0
+    fi
+    if ! command -v SwitchAudioSource >/dev/null 2>&1; then
+        return 0
+    fi
+    if is_output_watch_running; then
+        return 0
+    fi
+
+    (
+        while true; do
+            target="$(resolve_web_output_device)"
+            current="$(get_current_output_device)"
+            if [ -n "$target" ] && [ "$current" != "$target" ]; then
+                if ! is_meeting_output_device "$current"; then
+                    save_audio_output_backup
+                fi
+                switch_audio_output "$target" || true
+            fi
+            sleep "$OUTPUT_WATCH_INTERVAL"
+        done
+    ) &
+
+    echo "$!" > "$OUTPUT_WATCH_PID_FILE"
+}
+
+stop_output_watch() {
+    if [ -f "$OUTPUT_WATCH_PID_FILE" ]; then
+        local pid
+        pid="$(cat "$OUTPUT_WATCH_PID_FILE" 2>/dev/null || true)"
+        if [ -n "$pid" ] && ps -p "$pid" > /dev/null 2>&1; then
+            kill "$pid" >/dev/null 2>&1 || true
+        fi
+        rm -f "$OUTPUT_WATCH_PID_FILE"
+    fi
+}
+
+resolve_web_input_device() {
+    local requested="${MEETING_WEB_INPUT_DEVICE:-BlackHole 2ch}"
+
+    if audio_device_exists "$requested"; then
+        printf '%s' "$requested"
+        return 0
+    fi
+
+    if [ "$requested" != "BlackHole 2ch" ] && audio_device_exists "BlackHole 2ch"; then
+        printf '%s' "BlackHole 2ch"
+        return 0
+    fi
+
+    local fallback
+    fallback="$(get_default_audio_device)"
+    printf '%s' "$fallback"
+    return 0
+}
+
+resolve_web_mic_device() {
+    local requested="${MEETING_WEB_MIC_DEVICE:-}"
+    local earphone_device="${MEETING_WEB_MIC_DEVICE_EARPHONE:-}"
+
+    if [ -n "$earphone_device" ]; then
+        if resolve_avfoundation_audio_index "$earphone_device" >/dev/null 2>&1; then
+            printf '%s' "$earphone_device"
+            return 0
+        fi
+        if is_earphone_connected; then
+            printf '%s' "$earphone_device"
+            return 0
+        fi
+    fi
+
+    if [ -n "$requested" ] && [ "$requested" != "auto" ]; then
+        printf '%s' "$requested"
+        return 0
+    fi
+
+    printf '%s' "$(get_default_audio_device)"
+}
+
+get_web_auto_level_filter() {
+    if [ "${MEETING_WEB_AUTO_LEVEL:-0}" = "1" ] && [ -n "${MEETING_WEB_AUTO_LEVEL_FILTER:-}" ]; then
+        printf '%s' "$MEETING_WEB_AUTO_LEVEL_FILTER"
+    fi
+}
+
+get_web_limiter_filter() {
+    if [ "${MEETING_WEB_LIMITER:-0}" = "1" ] && [ -n "${MEETING_WEB_LIMITER_FILTER:-}" ]; then
+        printf '%s' "$MEETING_WEB_LIMITER_FILTER"
+    fi
+}
+
+warn_web_output_routing() {
+    local output_device
+    output_device="$(get_current_output_device)"
+    local expected_output
+    expected_output="$(resolve_web_output_device)"
+
+    if [ -n "$expected_output" ]; then
+        if [ "${MEETING_WEB_OUTPUT_DEVICE:-auto}" = "auto" ] \
+            && ! audio_device_exists "$MEETING_AUDIO_EARPHONE" \
+            && ! audio_device_exists "$MEETING_AUDIO_SPEAKER"; then
+            meeting_log "Warning: meeting output devices not found (earphone/speaker)"
+            echo -e "${YELLOW}警告: 会議用スピーカー/イヤホンが見つかりません${NC}"
+            echo "Multi-Output（BlackHole + スピーカー/イヤホン）を作成して設定してください"
+        fi
+        if [ "$output_device" != "$expected_output" ]; then
+            if [ "${MEETING_WEB_OUTPUT_AUTO_SWITCH:-0}" = "1" ] && command -v SwitchAudioSource >/dev/null 2>&1; then
+                save_audio_output_backup
+                switch_audio_output "$expected_output" || true
+                output_device="$(get_current_output_device)"
+            fi
+            if [ "$output_device" != "$expected_output" ]; then
+                echo -e "${YELLOW}警告: 出力が「$expected_output」になっていません（現在: ${output_device:-不明}）${NC}"
+                echo "BlackHoleを含む出力に切り替えないとWEB会議の音声が録音されません"
+            fi
+        fi
+        return 0
+    fi
+
+    if [ -n "$output_device" ] && [[ "$output_device" != *"BlackHole"* ]]; then
+        echo -e "${YELLOW}警告: 出力がBlackHoleを含むデバイスではありません（現在: $output_device）${NC}"
+        echo "Meet/Zoomの音声がBlackHoleに流れないため、録音がほぼ無音になります"
+    fi
+}
+
+warn_multisoundchanger() {
+    if [ "$MEETING_MULTI_SOUND_CHANGER_CHECK" != "1" ]; then
+        return 0
+    fi
+    if [ ! -d "$MEETING_MULTI_SOUND_CHANGER_APP" ]; then
+        meeting_log "Warning: MultiSoundChanger app not found"
+        echo -e "${YELLOW}警告: MultiSoundChangerが見つかりません${NC}"
+        echo "Volキーで音量調整できない場合は $MEETING_MULTI_SOUND_CHANGER_APP を導入してください"
+        return 0
+    fi
+    if ! pgrep -f "MultiSoundChanger" >/dev/null 2>&1; then
+        meeting_log "Warning: MultiSoundChanger not running"
+        echo -e "${YELLOW}警告: MultiSoundChangerが起動していません${NC}"
+        echo "Multi-Output時の音量調整のために起動してください"
+    fi
+}
+
+trim_text() {
+    printf '%s' "$1" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+}
+
+clean_transcript_file() {
+    local transcript_path="$1"
+    if [ -z "$transcript_path" ] || [ ! -f "$transcript_path" ]; then
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        return 0
+    fi
+    local cleaned_path="${transcript_path}.cleaned"
+    python3 - "$transcript_path" "$cleaned_path" << 'PY'
+import re
+import sys
+
+input_path = sys.argv[1]
+output_path = sys.argv[2]
+
+try:
+    with open(input_path, "r", encoding="utf-8") as f:
+        raw_lines = [line.rstrip("\n") for line in f]
+except Exception:
+    sys.exit(0)
+
+def normalize(line):
+    line = line.strip()
+    if not line:
+        return ""
+    line = re.sub(r"[。．.!?！？]+$", "", line)
+    line = re.sub(r"[\s\u3000]+", " ", line)
+    return line.strip()
+
+targets = {
+    "ご視聴ありがとうございました",
+    "ご清聴ありがとうございました",
+    "ご視聴ありがとうございます",
+}
+
+counts = {}
+normalized_lines = []
+for line in raw_lines:
+    normalized = normalize(line)
+    normalized_lines.append(normalized)
+    if normalized:
+        counts[normalized] = counts.get(normalized, 0) + 1
+
+drop_targets = {t for t in targets if counts.get(t, 0) >= 3}
+
+cleaned = []
+for line, normalized in zip(raw_lines, normalized_lines):
+    if not normalized:
+        continue
+    if normalized in drop_targets:
+        continue
+    cleaned.append(line.strip())
+
+if not cleaned:
+    cleaned = [line.strip() for line in raw_lines if line.strip()]
+
+try:
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(cleaned))
+        f.write("\n")
+except Exception:
+    sys.exit(0)
+PY
+
+    if [ -s "$cleaned_path" ]; then
+        mv "$cleaned_path" "$transcript_path"
+    else
+        rm -f "$cleaned_path"
+    fi
+}
+
+list_side_business_projects() {
+    if [ ! -d "$SIDE_BUSINESS_DIR" ]; then
+        return 0
+    fi
+    find "$SIDE_BUSINESS_DIR" -mindepth 1 -maxdepth 1 -type d -print
+}
+
+list_side_business_project_names() {
+    local names=""
+    local project
+    while IFS= read -r project; do
+        [ -z "$project" ] && continue
+        local base
+        base="$(basename "$project")"
+        names="${names}${names:+,}${base}"
+    done < <(list_side_business_projects)
+    printf '%s' "$names"
+}
+
+list_product_files() {
+    if [ ! -d "$PRODUCTS_DIR" ]; then
+        return 0
+    fi
+    find "$PRODUCTS_DIR" -type f -name "*.md" \
+        | grep -v "/reference-analysis/" \
+        | grep -v "/README.md$" \
+        | sed "s|$PRODUCTS_DIR/||"
+}
+
+match_regular_meeting() {
+    local title="$1"
+    local normalized
+    normalized="$(normalize_ascii "$title")"
+    if [ -z "$normalized" ]; then
+        return 1
+    fi
+    if [ ! -f "$REGULAR_MEETINGS_FILE" ]; then
+        return 1
+    fi
+    while IFS='|' read -r canonical aliases; do
+        canonical="$(trim_text "$canonical")"
+        aliases="$(trim_text "$aliases")"
+        if [ -z "$canonical" ]; then
+            continue
+        fi
+        if [[ "$canonical" == \#* ]]; then
+            continue
+        fi
+        local candidate
+        local candidate_normalized
+        candidate_normalized="$(normalize_ascii "$canonical")"
+        if [ -n "$candidate_normalized" ] && [ "$candidate_normalized" = "$normalized" ]; then
+            printf '%s' "$canonical"
+            return 0
+        fi
+        IFS=',' read -ra alias_list <<< "$aliases"
+        for candidate in "${alias_list[@]}"; do
+            candidate="$(trim_text "$candidate")"
+            [ -z "$candidate" ] && continue
+            candidate_normalized="$(normalize_ascii "$candidate")"
+            if [ -n "$candidate_normalized" ] && [ "$candidate_normalized" = "$normalized" ]; then
+                printf '%s' "$canonical"
+                return 0
+            fi
+        done
+    done < "$REGULAR_MEETINGS_FILE"
+    return 1
+}
+
+normalize_storage_area() {
+    local value
+    value="$(trim_text "$1")"
+    case "$value" in
+        work|仕事|業務)
+            printf '%s' "work"
+            ;;
+        side-business|sidebusiness|個人事業|副業)
+            printf '%s' "side-business"
+            ;;
+        activity|activities|表現|創作|活動)
+            printf '%s' "activity"
+            ;;
+        thoughts|thought|思想|価値観)
+            printf '%s' "thoughts"
+            ;;
+        life|生活|日常|家族|恋愛)
+            printf '%s' "life"
+            ;;
+        private|プライベート)
+            printf '%s' "private"
+            ;;
+        unknown|不明)
+            printf '%s' "unknown"
+            ;;
+        *)
+            printf '%s' ""
+            ;;
+    esac
+}
+
+resolve_side_business_project() {
+    local raw
+    raw="$(trim_text "$1")"
+    if [ -z "$raw" ]; then
+        return 1
+    fi
+    local project
+    while IFS= read -r project; do
+        local base
+        base="$(basename "$project")"
+        if [ "$base" = "$raw" ]; then
+            printf '%s' "$base"
+            return 0
+        fi
+    done < <(list_side_business_projects)
+    printf '%s' "$(sanitize_filename "$raw")"
+}
+
+strip_meet_suffix() {
+    local title="$1"
+    printf '%s' "$title" | sed -E 's/[[:space:]]*[-–][[:space:]]*Google Meet$//'
+}
+
+strip_zoom_suffix() {
+    local title="$1"
+    printf '%s' "$title" | sed -E 's/[[:space:]]*[-–][[:space:]]*Zoom Meeting$//; s/[[:space:]]*[-–][[:space:]]*Zoom$//'
+}
+
+normalize_ascii() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' | tr -d '_' | tr -d '-'
+}
+
+is_placeholder_title() {
+    local title
+    title="$(trim_text "$1")"
+    if [ -z "$title" ]; then
+        return 0
+    fi
+    if [ "$title" = "無題" ]; then
+        return 0
+    fi
+    local normalized
+    normalized="$(normalize_ascii "$title")"
+    case "$normalized" in
+        "untitled"|"zoommeeting"|"zoom"|"meeting"|"googlemeet"|"meet")
+            return 0
+            ;;
+    esac
+    # Google Meet URL由来のタイトル（例: xbt-zzew-odn, Meet - xbt-zzew-odn）
+    if [[ "$title" =~ ^[a-z]{3}-[a-z]{4}-[a-z]{3}$ ]]; then
+        return 0
+    fi
+    if [[ "$title" =~ ^Meet[[:space:]-]+[a-z]{3}-[a-z]{4}-[a-z]{3}$ ]]; then
+        return 0
+    fi
+    return 1
+}
+
+sanitize_filename() {
+    local input="$1"
+    local cleaned
+    cleaned="$(printf '%s' "$input" | tr '\n' ' ' | sed -E 's/[[:space:]]+/_/g; s/[\\/:*?"<>|]/_/g; s/^_+//; s/_+$//; s/_+/_/g')"
+    if [ -z "$cleaned" ]; then
+        cleaned="無題"
+    fi
+    printf '%s' "$cleaned"
+}
+
+normalize_date_display() {
+    local raw
+    raw="$(trim_text "$1")"
+    if [ -z "$raw" ]; then
+        return 1
+    fi
+    if [[ "$raw" =~ ^[0-9]{8}$ ]]; then
+        printf '%s' "${raw:0:4}-${raw:4:2}-${raw:6:2}"
+        return 0
+    fi
+    if [[ "$raw" =~ ^[0-9]{4}/[0-9]{2}/[0-9]{2}$ ]]; then
+        printf '%s' "${raw//\//-}"
+        return 0
+    fi
+    if [[ "$raw" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        printf '%s' "$raw"
+        return 0
+    fi
+    return 1
+}
+
+extract_date_from_filename() {
+    local base
+    base="$(basename "$1")"
+    if [[ "$base" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2})_ ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ "$base" =~ ^([0-9]{8})_ ]]; then
+        local compact="${BASH_REMATCH[1]}"
+        printf '%s' "${compact:0:4}-${compact:4:2}-${compact:6:2}"
+        return 0
+    fi
+    return 1
+}
+
+extract_title_from_filename() {
+    local base
+    base="$(basename "$1")"
+    base="${base%.*}"
+    base="$(printf '%s' "$base" | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{4}_//; s/^[0-9]{8}_[0-9]{4}_//; s/^[0-9]{4}-[0-9]{2}-[0-9]{2}_//; s/^[0-9]{8}_//')"
+    base="${base//_/ }"
+    base="$(trim_text "$base")"
+    if [ -z "$base" ]; then
+        return 1
+    fi
+    printf '%s' "$base"
+}
+
+extract_date_from_md() {
+    local md_file="$1"
+    if [ -z "$md_file" ] || [ ! -f "$md_file" ]; then
+        return 1
+    fi
+    local line
+    line="$(grep -m 1 -E '^-?[[:space:]]*\*\*日付\*\*:' "$md_file" 2>/dev/null | sed -E 's/.*\*\*日付\*\*:[[:space:]]*//')"
+    if [ -n "$line" ]; then
+        local normalized
+        normalized="$(normalize_date_display "$line" || true)"
+        if [ -n "$normalized" ]; then
+            printf '%s' "$normalized"
+            return 0
+        fi
+    fi
+    extract_date_from_filename "$md_file"
+}
+
+extract_title_from_md() {
+    local md_file="$1"
+    if [ -z "$md_file" ] || [ ! -f "$md_file" ]; then
+        return 1
+    fi
+    local line
+    line="$(grep -m 1 '^# ' "$md_file" 2>/dev/null | sed -E 's/^# //')"
+    line="$(trim_text "$line")"
+    if [ -z "$line" ]; then
+        return 1
+    fi
+    line="$(printf '%s' "$line" | sed -E 's/^[0-9]{8}_//; s/^[0-9]{4}-[0-9]{2}-[0-9]{2}_//')"
+    line="$(trim_text "$line")"
+    if [ -z "$line" ]; then
+        return 1
+    fi
+    printf '%s' "$line"
+}
+
+resolve_claude() {
+    local direct_path="$HOME/.nvm/versions/node/v20.19.4/bin/claude"
+    if [ -x "$direct_path" ]; then
+        printf '%s' "$direct_path"
+        return 0
+    fi
+    local candidate
+    candidate="$(ls -1 "$HOME"/.nvm/versions/node/*/bin/claude 2>/dev/null | tail -n 1 || true)"
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+        printf '%s' "$candidate"
+        return 0
+    fi
+    if command -v claude >/dev/null 2>&1; then
+        command -v claude
+        return 0
+    fi
+    return 1
+}
+
+resolve_codex() {
+    # 直接パスを探索（watch等のバックグラウンド実行時にPATHが通らないため）
+    local direct_path="$HOME/.nvm/versions/node/v20.19.4/bin/codex"
+    if [ -x "$direct_path" ]; then
+        printf '%s' "$direct_path"
+        return 0
+    fi
+    local candidate
+    candidate="$(ls -1 "$HOME"/.nvm/versions/node/*/bin/codex 2>/dev/null | tail -n 1 || true)"
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+        printf '%s' "$candidate"
+        return 0
+    fi
+    if command -v codex >/dev/null 2>&1; then
+        command -v codex
+        return 0
+    fi
+    return 1
+}
+
+resolve_whisper() {
+    if [ -n "${WHISPER_PATH:-}" ] && [ -x "$WHISPER_PATH" ]; then
+        printf '%s' "$WHISPER_PATH"
+        return 0
+    fi
+    if command -v whisper >/dev/null 2>&1; then
+        command -v whisper
+        return 0
+    fi
+    return 1
+}
+
+codex_exec() {
+    local codex_bin="$1"
+    shift
+
+    if [ "${MEETING_CODEX_SKIP_GIT_CHECK:-1}" = "1" ]; then
+        "$codex_bin" exec --skip-git-repo-check "$@"
+    else
+        "$codex_bin" exec "$@"
+    fi
+}
+
+extract_meeting_metadata() {
+    local transcript_excerpt="$1"
+    local system_prompt="あなたは議事録の分類と相手名抽出を行います。必ずJSONのみを返してください。"
+    local side_projects
+    side_projects="$(list_side_business_project_names)"
+    local prompt
+    prompt=$(cat << EOF
+以下は会議の文字起こしの抜粋です。内容から会議種別と相手名を推定してください。
+
+要件:
+- category: "商談" か "社内" か "プライベート" のどれか
+- counterparty: 商談なら会社名/組織名、社内なら相談相手（部署/チーム名または個人名）
+- 個人名の場合は「◯◯さん」形式、**人名はローマ字表記**
+- 不明なら "不明"
+- storage_area: "work" | "side-business" | "private" | "activity" | "thoughts" | "life" | "unknown"
+- project_name: storage_area が "side-business" の場合のみ設定（不明なら空文字）
+
+判断基準:
+- 仕事の会議/業務/社内連携 → work
+- 個人事業の運営/収益/スポンサー/顧客対応 → side-business
+- 表現/創作/音楽/文章/制作 → activity
+- 価値観/思想/人生観 → thoughts
+- 日常/家族/恋愛 → life
+- その他の私用 → private
+- 判定不能 → unknown
+
+既知の個人事業プロジェクト: ${side_projects:-不明}
+
+出力はJSONのみで、他の文章は一切出さないでください。
+
+抜粋:
+<<<
+$transcript_excerpt
+>>>
+EOF
+)
+
+    local out=""
+    local claude_bin=""
+    local codex_bin=""
+    if codex_bin="$(resolve_codex)"; then
+        local tmpfile
+        tmpfile=$(mktemp)
+        codex_exec "$codex_bin" -o "$tmpfile" "$prompt" >/dev/null 2>&1 || true
+        if [ -f "$tmpfile" ]; then
+            out=$(cat "$tmpfile")
+            rm -f "$tmpfile"
+        fi
+    elif claude_bin="$(resolve_claude)"; then
+        out="$(printf '%s' "$prompt" | "$claude_bin" -p \
+            --output-format text \
+            --append-system-prompt "$system_prompt" \
+            2>/dev/null || true)"
+    fi
+
+    printf '%s' "$out"
+}
+
+extract_knowledge_updates() {
+    local transcript_excerpt="$1"
+    local meeting_title="$2"
+    local category="$3"
+    local system_prompt="あなたは会議内容からナレッジ更新候補を抽出します。必ずJSONのみを返してください。"
+    local product_files
+    product_files="$(list_product_files)"
+    local prompt
+    prompt=$(cat << EOF
+以下は会議の文字起こしの抜粋です。新しい知見があれば、ナレッジへ追記する候補を抽出してください。
+
+会議タイトル: $meeting_title
+カテゴリ: $category
+
+追記先候補（knowledge/products/ 相対パス）:
+${product_files:-なし}
+
+出力JSONのみ（他の文字は出力しない）:
+{
+  "product_updates": [
+    {"target": "<relative_path>", "items": ["..."]}
+  ],
+  "itsuki_traits_updates": [
+    {"section": "<セクション名>", "items": ["..."]}
+  ],
+  "itsuki_thoughts_updates": ["..."]
+}
+
+ルール:
+- 新規性が不明な内容は出力しない
+- 推測は禁止
+- 1項目は短い箇条書き
+- 人名はローマ字表記
+- targetは追記先候補から選ぶ（該当なしなら空配列）
+- sectionは次のいずれか: 思考・行動特性 / コミュニケーション特性 / 強み・弱み / モチベーション・価値観
+- 該当がなければ空配列で返す
+
+文字起こし抜粋:
+<<<
+$transcript_excerpt
+>>>
+EOF
+)
+
+    local out=""
+    local claude_bin=""
+    local codex_bin=""
+    if codex_bin="$(resolve_codex)"; then
+        local tmpfile
+        tmpfile=$(mktemp)
+        codex_exec "$codex_bin" -o "$tmpfile" "$prompt" >/dev/null 2>&1 || true
+        if [ -f "$tmpfile" ]; then
+            out=$(cat "$tmpfile")
+            rm -f "$tmpfile"
+        fi
+    elif claude_bin="$(resolve_claude)"; then
+        out="$(printf '%s' "$prompt" | "$claude_bin" -p \
+            --output-format text \
+            --append-system-prompt "$system_prompt" \
+            2>/dev/null || true)"
+    fi
+
+    printf '%s' "$out"
+}
+
+parse_meeting_metadata() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        return 1
+    fi
+    python3 - << 'PY'
+import json
+import re
+import sys
+
+text = sys.stdin.read()
+match = re.search(r'\{.*\}', text, re.S)
+if not match:
+    sys.exit(1)
+try:
+    payload = json.loads(match.group(0))
+except Exception:
+    sys.exit(1)
+
+category = str(payload.get("category", "")).strip()
+counterparty = str(payload.get("counterparty", "")).strip()
+storage_area = str(payload.get("storage_area", "")).strip()
+project_name = str(payload.get("project_name", "")).strip()
+print(f"{category}|{counterparty}|{storage_area}|{project_name}")
+PY
+}
+
+apply_knowledge_updates() {
+    local transcript_excerpt="$1"
+    local md_file="$2"
+    local display_title="$3"
+    local safe_title="$4"
+    local date_display="$5"
+    local category="$6"
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local updates_raw
+    updates_raw="$(extract_knowledge_updates "$transcript_excerpt" "$display_title" "$category")"
+    if [ -z "$updates_raw" ]; then
+        return 0
+    fi
+
+    local script
+    script=$(cat << 'PY'
+import json
+import os
+import re
+import sys
+
+raw = sys.stdin.read()
+match = re.search(r'\{.*\}', raw, re.S)
+if not match:
+    sys.exit(0)
+try:
+    payload = json.loads(match.group(0))
+except Exception:
+    sys.exit(0)
+
+md_file = sys.argv[1]
+meeting_title = sys.argv[2] or "会議"
+safe_title = sys.argv[3] or "無題"
+date_display = sys.argv[4]
+products_dir = os.path.abspath(sys.argv[5])
+traits_file = sys.argv[6]
+thoughts_dir = sys.argv[7]
+
+section_map = {
+    "思考・行動特性": "思考・行動特性",
+    "コミュニケーション特性": "コミュニケーション特性",
+    "強み・弱み": "強み・弱み",
+    "モチベーション・価値観": "モチベーション・価値観",
+}
+
+def normalize_items(items):
+    cleaned = []
+    for item in items or []:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if not text:
+            continue
+        cleaned.append(text)
+    return cleaned
+
+def insert_into_section(lines, heading, new_lines):
+    try:
+        start = next(i for i, line in enumerate(lines) if line.strip() == heading)
+    except StopIteration:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append(heading)
+        lines.extend(new_lines)
+        return lines
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if lines[i].startswith("## "):
+            end = i
+            break
+    lines[end:end] = new_lines
+    return lines
+
+updated = []
+
+product_updates = payload.get("product_updates") or []
+for update in product_updates:
+    if not isinstance(update, dict):
+        continue
+    target = str(update.get("target", "")).strip().lstrip("/")
+    if not target or ".." in target:
+        continue
+    path = os.path.abspath(os.path.join(products_dir, target))
+    if not path.startswith(products_dir + os.sep):
+        continue
+    if not os.path.exists(path):
+        continue
+    items = normalize_items(update.get("items"))
+    if not items:
+        continue
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except Exception:
+        continue
+    new_lines = []
+    for item in items:
+        line = f"- {date_display}: {item}"
+        if line in lines:
+            continue
+        new_lines.append(line)
+    if not new_lines:
+        continue
+    lines = insert_into_section(lines, "## 追記", new_lines)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        updated.append(path)
+    except Exception:
+        continue
+
+traits_updates = payload.get("itsuki_traits_updates") or []
+if traits_updates and os.path.exists(traits_file):
+    try:
+        with open(traits_file, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except Exception:
+        lines = []
+    for update in traits_updates:
+        if not isinstance(update, dict):
+            continue
+        section = str(update.get("section", "")).strip()
+        section = section_map.get(section, "")
+        if not section:
+            continue
+        items = normalize_items(update.get("items"))
+        if not items:
+            continue
+        new_lines = []
+        for item in items:
+            if date_display not in item:
+                item = f"{item} ({date_display})"
+            line = f"- {item}"
+            if line in lines:
+                continue
+            new_lines.append(line)
+        if not new_lines:
+            continue
+        lines = insert_into_section(lines, f"## {section}", new_lines)
+    if lines:
+        try:
+            with open(traits_file, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            updated.append(traits_file)
+        except Exception:
+            pass
+
+thought_items = normalize_items(payload.get("itsuki_thoughts_updates"))
+if thought_items:
+    if safe_title in ("", "無題"):
+        safe_title = "会議"
+    safe_title = safe_title.strip("_")
+    thought_path = os.path.join(thoughts_dir, f"{date_display}_{safe_title}_会議からの思想メモ.md")
+    if not os.path.exists(thoughts_dir):
+        os.makedirs(thoughts_dir, exist_ok=True)
+    if os.path.exists(thought_path):
+        try:
+            with open(thought_path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except Exception:
+            lines = []
+        new_lines = []
+        for item in thought_items:
+            line = f"- {item}"
+            if line in lines:
+                continue
+            new_lines.append(line)
+        if new_lines:
+            insert_at = len(lines)
+            for i, line in enumerate(lines):
+                if line.strip().startswith("出典:"):
+                    insert_at = i
+                    break
+            lines[insert_at:insert_at] = new_lines
+            try:
+                with open(thought_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n")
+                updated.append(thought_path)
+            except Exception:
+                pass
+    else:
+        try:
+            with open(thought_path, "w", encoding="utf-8") as f:
+                f.write(f"# {meeting_title} 思想メモ（{date_display}）\n\n")
+                for item in thought_items:
+                    f.write(f"- {item}\n")
+                f.write(f"\n出典: `{md_file}`\n")
+            updated.append(thought_path)
+        except Exception:
+            pass
+
+if updated:
+    for path in dict.fromkeys(updated):
+        print(path)
+PY
+)
+
+    local updated_paths
+    updated_paths="$(
+        printf '%s' "$updates_raw" | python3 -c "$script" "$md_file" "$display_title" "$safe_title" \
+            "$date_display" "$PRODUCTS_DIR" "$ITSUKI_TRAITS_FILE" "$THOUGHTS_DIR"
+    )"
+
+    if [ -n "$updated_paths" ]; then
+        echo -e "${GREEN}ナレッジを更新しました${NC}"
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            echo "  - $line"
+        done <<< "$updated_paths"
+        echo ""
+    fi
+}
+
+load_slack_env() {
+    local env_file="/Users/itsuki.matsumoto/claude-code/tools/podcast-summarizer/.env"
+    if [ -f "$env_file" ]; then
+        set -a
+        # shellcheck disable=SC1090
+        . "$env_file"
+        set +a
+    fi
+}
+
+generate_meeting_summary() {
+    local transcript="$1"
+    local summary=""
+    LAST_MEETING_SUMMARY_STATUS="unknown"
+
+    # 文字起こしが短すぎる場合はスキップ（30文字未満）
+    if [ ${#transcript} -lt 30 ]; then
+        meeting_log "Summary skipped: transcript too short (${#transcript} chars)"
+        LAST_MEETING_SUMMARY_STATUS="skipped_short"
+        printf '%s' ""
+        return 0
+    fi
+
+    local prompt="以下の会議の文字起こしを要約してください。
+
+## フォーマット
+1. **議題**（2-4行）: 主要なトピックを箇条書き
+2. **決定事項・TODO**（あれば必須）: 「誰が」「何をする」の形式で記載
+   - 特にItsuki（録音者本人）のアクションは必ず含める
+   - 松本=Itsukiなので「Itsuki」と表記すること
+   - **人名はローマ字表記**
+   - 例: 「Itsuki: サブグループの仕様を整理する」
+
+## ルール
+- 余計な前置きは不要
+- 決定事項がない場合は議題のみでOK
+
+文字起こし:
+$(printf '%s' "$transcript" | head -c 6000)"
+
+    # 優先順位: Codex CLI > Claude CLI (resolve_xxx で直接パスも探索)
+    local codex_bin=""
+    local claude_bin=""
+    if codex_bin="$(resolve_codex)"; then
+        echo -e "${YELLOW}サマリを生成中（Codex）...${NC}" >&2
+        local tmpfile
+        tmpfile=$(mktemp)
+        local codex_exit_code=0
+        local codex_stderr_file
+        codex_stderr_file=$(mktemp)
+        codex_exec "$codex_bin" -o "$tmpfile" "$prompt" >/dev/null 2>"$codex_stderr_file" || codex_exit_code=$?
+        if [ "$codex_exit_code" -ne 0 ]; then
+            echo -e "${RED}Codex failed (exit: $codex_exit_code)${NC}" >&2
+            echo "Codex stderr: $(cat "$codex_stderr_file" | head -5)" >&2
+            meeting_log "Summary failed: codex exit=$codex_exit_code"
+        fi
+        rm -f "$codex_stderr_file"
+        if [ -f "$tmpfile" ]; then
+            summary=$(cat "$tmpfile" | head -10)
+            rm -f "$tmpfile"
+        fi
+        if [ -n "$summary" ]; then
+            LAST_MEETING_SUMMARY_STATUS="generated"
+        else
+            LAST_MEETING_SUMMARY_STATUS="error"
+        fi
+    elif claude_bin="$(resolve_claude)"; then
+        echo -e "${YELLOW}サマリを生成中（Claude）...${NC}" >&2
+        summary=$("$claude_bin" -p --model haiku "$prompt" 2>/dev/null || true)
+        if [ -n "$summary" ]; then
+            LAST_MEETING_SUMMARY_STATUS="generated"
+        else
+            LAST_MEETING_SUMMARY_STATUS="error"
+            meeting_log "Summary failed: claude returned empty"
+        fi
+    else
+        LAST_MEETING_SUMMARY_STATUS="no_cli"
+        meeting_log "Summary skipped: codex/claude not found"
+    fi
+
+    printf '%s' "$summary"
+}
+
+generate_title_from_summary() {
+    local summary="$1"
+    local title=""
+
+    if [ -z "$summary" ]; then
+        printf '%s' ""
+        return 0
+    fi
+
+    local prompt="以下の会議サマリから、会議のタイトルを15文字以内で生成してください。
+- 会議の主題がわかる簡潔なタイトル
+- 余計な前置きは不要、タイトルのみ出力
+- 例: 「新機能開発MTG」「週次定例」「A社商談」
+
+サマリ:
+$summary"
+
+    # 優先順位: Codex CLI > Claude CLI (resolve_xxx で直接パスも探索)
+    local codex_bin=""
+    local claude_bin=""
+    if codex_bin="$(resolve_codex)"; then
+        echo -e "${YELLOW}タイトルを生成中（Codex）...${NC}" >&2
+        local tmpfile
+        tmpfile=$(mktemp)
+        local codex_exit_code=0
+        local codex_stderr_file
+        codex_stderr_file=$(mktemp)
+        codex_exec "$codex_bin" -o "$tmpfile" "$prompt" >/dev/null 2>"$codex_stderr_file" || codex_exit_code=$?
+        if [ "$codex_exit_code" -ne 0 ]; then
+            echo -e "${RED}Codex title gen failed (exit: $codex_exit_code)${NC}" >&2
+            echo "Codex stderr: $(cat "$codex_stderr_file" | head -5)" >&2
+        fi
+        rm -f "$codex_stderr_file"
+        if [ -f "$tmpfile" ]; then
+            title=$(cat "$tmpfile" | head -1 | tr -d '\n')
+            rm -f "$tmpfile"
+        fi
+    elif claude_bin="$(resolve_claude)"; then
+        echo -e "${YELLOW}タイトルを生成中（Claude）...${NC}" >&2
+        title=$("$claude_bin" -p --model haiku "$prompt" 2>/dev/null | head -1 | tr -d '\n' || true)
+    fi
+
+    # タイトルから余計な記号を除去
+    title=$(printf '%s' "$title" | sed -E 's/^["「『]//; s/["」』]$//')
+
+    printf '%s' "$title"
+}
+
+format_platform_label() {
+    local platform
+    platform="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    case "$platform" in
+        meet|googlemeet|google)
+            printf '%s' "Meet"
+            ;;
+        zoom)
+            printf '%s' "Zoom"
+            ;;
+        teams|msteams|microsoftteams)
+            printf '%s' "Teams"
+            ;;
+        *)
+            printf '%s' "Web"
+            ;;
+    esac
+}
+
+format_duration() {
+    local total="${1:-0}"
+    if ! [[ "$total" =~ ^[0-9]+$ ]]; then
+        printf '%s' "0s"
+        return 0
+    fi
+    local hours=$((total / 3600))
+    local minutes=$(((total % 3600) / 60))
+    local seconds=$((total % 60))
+    if [ "$hours" -gt 0 ]; then
+        printf '%dh%dm%ds' "$hours" "$minutes" "$seconds"
+    elif [ "$minutes" -gt 0 ]; then
+        printf '%dm%ds' "$minutes" "$seconds"
+    else
+        printf '%ds' "$seconds"
+    fi
+}
+
+get_recording_started_at() {
+    if [ -f "$INFO_FILE" ]; then
+        stat -f %m "$INFO_FILE" 2>/dev/null || true
+    fi
+}
+
+extract_action_items_from_summary() {
+    local summary="$1"
+    if [ -z "$summary" ]; then
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        return 0
+    fi
+    printf '%s' "$summary" | python3 - << 'PY'
+import re
+import sys
+
+text = sys.stdin.read()
+lines = [line.rstrip() for line in text.splitlines()]
+
+items = []
+capture = False
+for raw in lines:
+    line = raw.strip()
+    if not line:
+        continue
+    if re.search(r"決定事項|TODO", line):
+        capture = True
+        continue
+    if capture and re.match(r"^\d+\.", line):
+        break
+    if capture and re.match(r"^(##|\*+)\s*議題", line):
+        break
+    if capture:
+        if re.match(r"^[-*・]\s*", line):
+            line = re.sub(r"^[-*・]\s*", "", line)
+        if line:
+            items.append(line)
+
+seen = set()
+dedup = []
+for item in items:
+    if item in seen:
+        continue
+    seen.add(item)
+    dedup.append(item)
+
+for item in dedup[:5]:
+    print(f"- {item}")
+PY
+}
+
+send_slack_message() {
+    local message="$1"
+    load_slack_env
+
+    local webhook="${MEETING_SLACK_WEBHOOK_URL:-${SLACK_WEBHOOK_URL:-}}"
+    if [ -z "$webhook" ]; then
+        meeting_log "Slack skipped: webhook not set"
+        echo -e "${YELLOW}Slack通知をスキップ: SLACK_WEBHOOK_URL が未設定${NC}"
+        return 2
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        meeting_log "Slack skipped: python3 not found"
+        echo -e "${YELLOW}Slack通知をスキップ: python3 が見つかりません${NC}"
+        return 2
+    fi
+
+    if python3 - "$webhook" "$message" << 'PY'
+import json
+import sys
+import urllib.request
+
+webhook = sys.argv[1]
+text = sys.argv[2]
+
+payload = {"text": text}
+data = json.dumps(payload).encode("utf-8")
+req = urllib.request.Request(webhook, data=data, headers={"Content-Type": "application/json"})
+try:
+    with urllib.request.urlopen(req, timeout=10) as res:
+        res.read()
+except Exception as exc:
+    print(f"Slack通知に失敗しました: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
+    then
+        echo -e "${GREEN}Slack通知を送信しました${NC}"
+        return 0
+    fi
+
+    meeting_log "Slack failed: post error"
+    echo -e "${YELLOW}Slack通知に失敗しました（詳細は上記）${NC}"
+    return 1
+}
+
+send_slack_start_notification() {
+    local meeting_title="$1"
+    local env_label="$2"
+    local message="録音を開始しました-会議名:${meeting_title} ${env_label}"
+    send_slack_message "$message"
+    return $?
+}
+
+send_slack_stop_notification() {
+    local duration_label="$1"
+    local message="録音を終了しました-${duration_label} 文字起こし中..."
+    send_slack_message "$message"
+    return $?
+}
+
+send_slack_completion_notification() {
+    local md_file="$1"
+    local summary="${2:-}"
+    local message=$'議事録を作成しました\n'
+    message+="パス：${md_file}"
+
+    local actions=""
+    if [ -n "$summary" ]; then
+        actions="$(extract_action_items_from_summary "$summary")"
+    fi
+    if [ -n "$actions" ]; then
+        message+="\n決定事項・持ち帰りタスク:\n${actions}"
+    fi
+
+    send_slack_message "$message"
+    return $?
+}
+
+create_meeting_memo() {
+    local transcript_content="$1"
+    local meeting_name="$2"
+    local category="$3"
+    local source="$4"
+    local platform="$5"
+    local storage_area="$6"
+    local project_name="$7"
+    local date_display="$8"
+    local transcript_file="${9:-}"
+    local existing_md="${10:-}"
+
+    LAST_MEETING_MD_FILE=""
+    LAST_MEETING_SUMMARY=""
+    LAST_MEETING_SUMMARY_GENERATED=0
+    LAST_MEETING_SUMMARY_STATUS=""
+
+    if [ -z "$date_display" ]; then
+        date_display="$(date '+%Y-%m-%d')"
+    fi
+    local date_compact="${date_display//-/}"
+
+    local cleaned_title="$meeting_name"
+    cleaned_title="$(strip_meet_suffix "$cleaned_title")"
+    cleaned_title="$(strip_zoom_suffix "$cleaned_title")"
+    cleaned_title="$(trim_text "$cleaned_title")"
+    if is_placeholder_title "$cleaned_title"; then
+        cleaned_title=""
+    fi
+
+    local inferred_category="$category"
+    local inferred_counterparty=""
+    local inferred_storage_area="$storage_area"
+    local inferred_project_name="$project_name"
+    local should_infer="no"
+    if [ -z "$cleaned_title" ] || [ "$category" = "$AUTO_CATEGORY" ]; then
+        should_infer="yes"
+    fi
+    if [ "$STORAGE_MODE" = "auto" ] && { [ -z "$storage_area" ] || [ "$storage_area" = "auto" ]; }; then
+        should_infer="yes"
+    fi
+    if [ "$should_infer" = "yes" ]; then
+        local excerpt
+        excerpt="$(printf '%s' "$transcript_content" | head -c 8000)"
+        local metadata_raw
+        metadata_raw="$(extract_meeting_metadata "$excerpt")"
+        if [ -n "$metadata_raw" ]; then
+            local parsed
+            parsed="$(printf '%s' "$metadata_raw" | parse_meeting_metadata 2>/dev/null || true)"
+            if [ -n "$parsed" ]; then
+                local parsed_category="${parsed%%|*}"
+                local remainder="${parsed#*|}"
+                local parsed_counterparty="${remainder%%|*}"
+                remainder="${remainder#*|}"
+                local parsed_storage_area="${remainder%%|*}"
+                local parsed_project_name="${remainder#*|}"
+                inferred_category="$parsed_category"
+                inferred_counterparty="$parsed_counterparty"
+                inferred_storage_area="$parsed_storage_area"
+                inferred_project_name="$parsed_project_name"
+            fi
+        fi
+    fi
+    if [ "$category" = "$AUTO_CATEGORY" ] && { [ "$inferred_category" = "商談" ] || [ "$inferred_category" = "社内" ] || [ "$inferred_category" = "$PRIVATE_CATEGORY" ]; }; then
+        category="$inferred_category"
+    fi
+    if [ -z "$cleaned_title" ] && [ -n "$inferred_counterparty" ] && [ "$inferred_counterparty" != "不明" ]; then
+        cleaned_title="$inferred_counterparty"
+    fi
+    if [ "$STORAGE_MODE" = "auto" ] && { [ -z "$storage_area" ] || [ "$storage_area" = "auto" ]; }; then
+        local normalized_storage
+        normalized_storage="$(normalize_storage_area "$inferred_storage_area")"
+        if [ -n "$normalized_storage" ]; then
+            storage_area="$normalized_storage"
+        fi
+        if [ -z "$project_name" ] && [ -n "$inferred_project_name" ] && [ "${MEETING_ALLOW_PROJECT_INFERENCE:-0}" = "1" ]; then
+            project_name="$inferred_project_name"
+        fi
+    fi
+    if [ -z "$storage_area" ] || [ "$storage_area" = "auto" ]; then
+        if [ "$category" = "$PRIVATE_CATEGORY" ]; then
+            storage_area="private"
+        elif [ "$category" = "商談" ] || [ "$category" = "社内" ]; then
+            storage_area="work"
+        else
+            storage_area="unknown"
+        fi
+    fi
+    if [ "$storage_area" = "unknown" ] && [ "$category" = "$AUTO_CATEGORY" ]; then
+        category="未分類"
+    fi
+
+    local regular_title=""
+    local regular_tag=""
+    regular_title="$(match_regular_meeting "$cleaned_title" || true)"
+    if [ -n "$regular_title" ]; then
+        cleaned_title="$regular_title"
+        regular_tag="$(sanitize_filename "$regular_title")"
+    fi
+
+    # タイトルが確定しない場合、サマリからタイトルを生成
+    local generated_summary=""
+    local summary_status_for_md=""
+    if [ -z "$cleaned_title" ]; then
+        echo -e "${YELLOW}タイトルが取得できなかったため、サマリから生成します...${NC}"
+        generated_summary=$(generate_meeting_summary "$transcript_content")
+        summary_status_for_md="$LAST_MEETING_SUMMARY_STATUS"
+        if [ -n "$generated_summary" ]; then
+            cleaned_title=$(generate_title_from_summary "$generated_summary")
+        fi
+        if [ -z "$cleaned_title" ]; then
+            cleaned_title="無題"
+        fi
+    fi
+    local display_title
+    display_title="$(printf '%s' "$cleaned_title" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^[[:space:]]+//; s/[[:space:]]+$//')"
+    local safe_title
+    safe_title="$(sanitize_filename "$display_title")"
+
+    # 要点サマリーを一度だけ生成（タイトル生成で使った場合は再利用）
+    local summary_for_md="$generated_summary"
+    if [ -z "$summary_for_md" ]; then
+        summary_for_md=$(generate_meeting_summary "$transcript_content")
+        summary_status_for_md="$LAST_MEETING_SUMMARY_STATUS"
+    fi
+    if [ -z "$summary_status_for_md" ]; then
+        summary_status_for_md="$LAST_MEETING_SUMMARY_STATUS"
+    fi
+
+    local output_dir=""
+    if [ "$storage_area" = "side-business" ]; then
+        output_dir="$SIDE_BUSINESS_DIR"
+        if [ -n "$project_name" ]; then
+            local safe_project
+            safe_project="$(resolve_side_business_project "$project_name")"
+            output_dir="$SIDE_BUSINESS_DIR/$safe_project"
+        fi
+    elif [ "$storage_area" = "activity" ]; then
+        output_dir="$ACTIVITIES_DIR"
+    elif [ "$storage_area" = "thoughts" ]; then
+        output_dir="$PRIVATE_THOUGHTS_DIR"
+    elif [ "$storage_area" = "life" ]; then
+        output_dir="$PRIVATE_LIFE_DIR"
+    elif [ "$storage_area" = "private" ]; then
+        output_dir="$PRIVATE_DIR"
+    elif [ "$storage_area" = "work" ]; then
+        if [ "$category" = "商談" ] || [ "$category" = "社内" ]; then
+            output_dir="$BASE_DIR/$category"
+        else
+            output_dir="$BASE_DIR"
+        fi
+    else
+        output_dir="$BASE_DIR"
+    fi
+    mkdir -p "$output_dir"
+
+    local md_file=""
+    if [ -n "$existing_md" ]; then
+        local existing_dir
+        existing_dir="$(dirname "$existing_md")"
+        if [ "$existing_dir" = "$output_dir" ]; then
+            md_file="$existing_md"
+        fi
+    fi
+    if [ -z "$md_file" ]; then
+        local base_name="${date_compact}_${safe_title}"
+        local md_filename="${base_name}.md"
+        local suffix=2
+        while [ -e "$output_dir/$md_filename" ]; do
+            md_filename="${base_name}_$(printf '%02d' "$suffix").md"
+            suffix=$((suffix + 1))
+        done
+        md_file="$output_dir/$md_filename"
+    fi
+
+    # タグを設定
+    local tag=""
+    if [ "$category" = "商談" ]; then
+        tag="#商談 #顧客名"
+    elif [ "$category" = "社内" ]; then
+        tag="#社内 #定例"
+    elif [ "$category" = "$PRIVATE_CATEGORY" ]; then
+        tag="#プライベート"
+    elif [ "$category" = "$AUTO_CATEGORY" ]; then
+        tag="#自動"
+    else
+        tag="#未分類"
+    fi
+    if [ -n "$regular_tag" ]; then
+        if [[ "$tag" != *"#定例"* ]]; then
+            tag="$tag #定例"
+        fi
+        tag="$tag #定例_${regular_tag}"
+    fi
+    if [ "$storage_area" = "side-business" ]; then
+        tag="$tag #個人事業"
+    elif [ "$storage_area" = "activity" ]; then
+        tag="$tag #表現活動"
+    elif [ "$storage_area" = "thoughts" ]; then
+        tag="$tag #思想"
+    elif [ "$storage_area" = "life" ]; then
+        tag="$tag #日常"
+    fi
+
+    # Markdownファイルを生成
+    local summary_block=""
+    if [ -n "$summary_for_md" ]; then
+        summary_block="$summary_for_md"
+    else
+        summary_block=$'<!-- Claude Codeで要約を依頼してください -->\n<!-- 例: このファイルを読んで要点サマリーを3-5行で記載して -->'
+    fi
+    cat > "$md_file" << EOF
+# ${date_compact}_${display_title}
+
+## 基本情報
+- **日付**: $date_display
+- **カテゴリ**: $category
+- **参加者**:
+- **目的**:
+
+## 要点サマリー
+$summary_block
+
+## 文字起こし全文
+$transcript_content
+
+## ネクストアクション
+- [ ]
+
+## タグ
+$tag
+EOF
+    meeting_log "Memo created: $md_file"
+
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}  会議メモを作成しました${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "  保存先: ${BLUE}$md_file${NC}"
+    echo ""
+    echo "===== 文字起こし内容（先頭300文字） ====="
+    if [ -n "$transcript_file" ] && [ -f "$transcript_file" ]; then
+        head -c 300 "$transcript_file"
+    else
+        printf '%s' "$transcript_content" | head -c 300
+    fi
+    echo ""
+    echo "========================================="
+    echo ""
+    if [ -n "$summary_for_md" ]; then
+        echo -e "${GREEN}要点サマリーを自動生成しました${NC}"
+    else
+        echo -e "${YELLOW}次のステップ:${NC}"
+        echo "  Claude Codeで要約を依頼:"
+        echo "  「$md_file を読んで要点サマリーを記載して」"
+    fi
+    echo ""
+
+    local knowledge_excerpt
+    knowledge_excerpt="$(printf '%s' "$transcript_content" | head -c 12000)"
+    apply_knowledge_updates "$knowledge_excerpt" "$md_file" "$display_title" "$safe_title" "$date_display" "$category"
+
+    LAST_MEETING_MD_FILE="$md_file"
+    LAST_MEETING_SUMMARY="$summary_for_md"
+    LAST_MEETING_SUMMARY_STATUS="${summary_status_for_md:-unknown}"
+    if [ -n "$summary_for_md" ]; then
+        LAST_MEETING_SUMMARY_GENERATED=1
+    fi
+
+    send_slack_completion_notification "$md_file" "$summary_for_md"
+    local slack_status=$?
+    case "$slack_status" in
+        0)
+            meeting_log "Slack completion notification sent: file=$md_file"
+            ;;
+        2)
+            meeting_log "Slack completion notification skipped: file=$md_file"
+            ;;
+        *)
+            meeting_log "Slack completion notification failed: file=$md_file"
+            ;;
+    esac
+}
+
+# 録音開始
+start_recording() {
+    local meeting_name="$1"
+    shift
+    local category=""
+    local web_mode=""
+    local web_requested="no"
+    local source="manual"
+    local platform="unknown"
+    local storage_area=""
+    local project_name=""
+    local recording_pid=""
+
+    # 引数をパース
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --商談|--shoudan)
+                category="商談"
+                shift
+                ;;
+            --社内|--shanai)
+                category="社内"
+                shift
+                ;;
+            --プライベート|--private|--personal)
+                category="$PRIVATE_CATEGORY"
+                storage_area="private"
+                shift
+                ;;
+            --auto|--自動)
+                category="$AUTO_CATEGORY"
+                source="auto"
+                shift
+                ;;
+            --side-business|--sidebusiness|--個人事業)
+                storage_area="side-business"
+                if [ -n "${2:-}" ] && [[ "${2:-}" != --* ]]; then
+                    project_name="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                if [ -z "$category" ]; then
+                    category="$PRIVATE_CATEGORY"
+                fi
+                ;;
+            --activity|--活動|--表現)
+                storage_area="activity"
+                if [ -z "$category" ]; then
+                    category="$PRIVATE_CATEGORY"
+                fi
+                shift
+                ;;
+            --thoughts|--思想)
+                storage_area="thoughts"
+                if [ -z "$category" ]; then
+                    category="$PRIVATE_CATEGORY"
+                fi
+                shift
+                ;;
+            --life|--日常|--生活)
+                storage_area="life"
+                if [ -z "$category" ]; then
+                    category="$PRIVATE_CATEGORY"
+                fi
+                shift
+                ;;
+            --platform)
+                platform="${2:-unknown}"
+                shift 2
+                ;;
+            --web|--WEB)
+                web_mode="web"
+                web_requested="yes"
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    if [ -z "$meeting_name" ]; then
+        echo -e "${RED}エラー: 会議名を指定してください${NC}"
+        echo "例: meeting start \"週次定例\" --社内"
+        exit 1
+    fi
+
+    if [ -z "$category" ] && [ "$source" = "manual" ]; then
+        echo -e "${RED}エラー: カテゴリを指定してください（--商談 / --社内 / --プライベート / --side-business / --activity / --thoughts / --life）${NC}"
+        echo "例: meeting start \"$meeting_name\" --社内"
+        exit 1
+    fi
+    if [ -z "$category" ] && [ "$source" = "auto" ]; then
+        category="$AUTO_CATEGORY"
+    fi
+
+    if [ -z "$storage_area" ]; then
+        if [ "$source" = "auto" ]; then
+            storage_area="auto"
+        elif [ "$category" = "$PRIVATE_CATEGORY" ]; then
+            storage_area="private"
+        elif [ "$category" = "商談" ] || [ "$category" = "社内" ]; then
+            storage_area="work"
+        elif [ "$STORAGE_MODE" = "auto" ]; then
+            storage_area="auto"
+        else
+            storage_area="work"
+        fi
+    fi
+
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        meeting_log "Error: ffmpeg not found"
+        echo -e "${RED}エラー: ffmpeg が見つかりません${NC}"
+        echo "対処: brew install ffmpeg"
+        exit 1
+    fi
+
+    meeting_log "Start requested: title=$meeting_name category=$category source=$source platform=$platform web_mode=${web_mode:-none} web_requested=$web_requested storage_area=$storage_area project=${project_name:-none}"
+    meeting_log "Audio devices (pre): output=$(get_current_output_device) input=$(get_default_audio_device)"
+    if [ -n "$web_mode" ]; then
+        log_avfoundation_devices
+    fi
+    if [ -n "$web_mode" ] && [ "${MEETING_WEB_OUTPUT_AUTO_SWITCH:-0}" = "1" ] && ! command -v SwitchAudioSource >/dev/null 2>&1; then
+        meeting_log "Warning: SwitchAudioSource not found; output auto switch disabled"
+        echo -e "${YELLOW}警告: SwitchAudioSourceが見つかりません（出力自動切替は無効）${NC}"
+    fi
+
+    # 既に録音中かチェック
+    if [ -f "$PID_FILE" ]; then
+        local old_pid=$(cat "$PID_FILE")
+        if ps -p "$old_pid" > /dev/null 2>&1; then
+            meeting_log "Start blocked: already recording (pid=$old_pid)"
+            echo -e "${RED}エラー: 既に録音中です${NC}"
+            echo "停止するには: meeting stop"
+            exit 1
+        fi
+    fi
+    stop_output_watch
+    meeting_log "Output watch stopped (start)"
+
+    # ファイル名生成
+    local date_str=$(date +"%Y-%m-%d_%H%M")
+    # 会議名から日付パターンを除去（重複防止）
+    # YYYY-MM-DD, YYYY/MM/DD, YYYYMMDD などを除去
+    local clean_name=$(echo "$meeting_name" | sed -E 's/^[0-9]{4}[-\/]?[0-9]{2}[-\/]?[0-9]{2}[_ -]*//g')
+    # 空になったらオリジナルを使用
+    if [ -z "$clean_name" ]; then
+        clean_name="$meeting_name"
+    fi
+    local safe_name=$(echo "$clean_name" | tr ' ' '_' | tr -cd '[:alnum:]_-')
+    local filename="${date_str}_${safe_name}"
+    local audio_file="$TEMP_DIR/${filename}.wav"
+    meeting_log "Recording file: $audio_file"
+
+    echo ""
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}  録音を開始します${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "  会議名:   ${BLUE}$meeting_name${NC}"
+    echo -e "  カテゴリ: ${BLUE}$category${NC}"
+    echo -e "  モード:   ${BLUE}$([ -n "$web_mode" ] && echo "WEB会議" || echo "対面会議")${NC}"
+    echo ""
+
+    if [ -n "$web_mode" ]; then
+        # WEB会議モード
+        if ! ls /Library/Audio/Plug-Ins/HAL/ 2>/dev/null | grep -qi blackhole; then
+            meeting_log "BlackHole not found, falling back to mic-only recording"
+            echo -e "${YELLOW}警告: BlackHoleがインストールされていません${NC}"
+            echo "WEB会議の相手の音声が録音されない可能性があります"
+            echo "インストール: brew install blackhole-2ch"
+            echo ""
+            echo "マイクのみで録音を続行します..."
+            web_mode=""
+        else
+            warn_web_output_routing
+            warn_multisoundchanger
+            local web_input_device
+            web_input_device="$(resolve_web_input_device)"
+            local mic_device
+            mic_device="$(resolve_web_mic_device)"
+            local input_mode="$MEETING_WEB_INPUT_MODE"
+            meeting_log "Web input mode: ${input_mode:-mix}"
+            local auto_filter
+            auto_filter="$(get_web_auto_level_filter)"
+            local limiter_filter
+            limiter_filter="$(get_web_limiter_filter)"
+            meeting_log "Web mic device: ${mic_device:-unset}"
+            meeting_log "Web input devices: mic=$mic_device blackhole=$web_input_device"
+            meeting_log "Web settings: gains(bh=$MEETING_WEB_INPUT_GAIN_BLACKHOLE mic=$MEETING_WEB_INPUT_GAIN_MIC) normalize=$MEETING_WEB_MIX_NORMALIZE auto_level=$MEETING_WEB_AUTO_LEVEL limiter=$MEETING_WEB_LIMITER"
+
+            if [ -z "$web_input_device" ]; then
+                web_input_device="BlackHole 2ch"
+            fi
+
+            case "$input_mode" in
+                mic)
+                    web_input_device="$mic_device"
+                    mic_device=""
+                    ;;
+                blackhole|single)
+                    mic_device=""
+                    ;;
+            esac
+
+            if [ -n "$mic_device" ] && [ "$mic_device" != "$web_input_device" ]; then
+                # マイク + BlackHole の両方を録音してミックス
+                local web_input_ref="$web_input_device"
+                local mic_ref="$mic_device"
+                local web_index
+                web_index="$(resolve_avfoundation_audio_index "$web_input_device" || true)"
+                if [ -n "$web_index" ]; then
+                    meeting_log "Web input index: $web_input_device -> $web_index"
+                    web_input_ref="$web_index"
+                fi
+                local mic_index
+                mic_index="$(resolve_avfoundation_audio_index "$mic_device" || true)"
+                if [ -n "$mic_index" ]; then
+                    meeting_log "Web mic index: $mic_device -> $mic_index"
+                    mic_ref="$mic_index"
+                fi
+                echo -e "  入力: ${BLUE}$mic_device${NC} (自分) + ${BLUE}$web_input_device${NC} (相手)"
+                local mix_filter
+                mix_filter="[0:a]volume=${MEETING_WEB_INPUT_GAIN_BLACKHOLE}[a0];[1:a]volume=${MEETING_WEB_INPUT_GAIN_MIC}[a1];[a0][a1]amix=inputs=2:duration=longest:dropout_transition=0:normalize=${MEETING_WEB_MIX_NORMALIZE}"
+                if [ -n "$auto_filter" ]; then
+                    mix_filter="${mix_filter},${auto_filter}"
+                fi
+                if [ -n "$limiter_filter" ]; then
+                    mix_filter="${mix_filter},${limiter_filter}"
+                fi
+                meeting_log "Web mix filter: $mix_filter"
+                ffmpeg -f avfoundation -i ":$web_input_ref" -f avfoundation -i ":$mic_ref" \
+                    -filter_complex "$mix_filter" \
+                    -acodec pcm_s16le -ar 16000 "$audio_file" > /dev/null 2>&1 &
+                recording_pid=$!
+            else
+                # マイクが取得できない、または同一デバイスの場合はBlackHoleのみ
+                local web_input_ref="$web_input_device"
+                local web_index
+                web_index="$(resolve_avfoundation_audio_index "$web_input_device" || true)"
+                if [ -n "$web_index" ]; then
+                    meeting_log "Web input index: $web_input_device -> $web_index"
+                    web_input_ref="$web_index"
+                fi
+                echo -e "  入力: ${BLUE}$web_input_device${NC}"
+                local single_gain="$MEETING_WEB_INPUT_GAIN_BLACKHOLE"
+                if [ "$input_mode" = "mic" ]; then
+                    single_gain="$MEETING_WEB_INPUT_GAIN_MIC"
+                fi
+                local single_filter
+                single_filter="volume=${single_gain}"
+                if [ -n "$auto_filter" ]; then
+                    single_filter="${single_filter},${auto_filter}"
+                fi
+                if [ -n "$limiter_filter" ]; then
+                    single_filter="${single_filter},${limiter_filter}"
+                fi
+                meeting_log "Web single filter: $single_filter"
+                ffmpeg -f avfoundation -i ":$web_input_ref" -filter:a "$single_filter" -acodec pcm_s16le -ar 16000 "$audio_file" > /dev/null 2>&1 &
+                recording_pid=$!
+            fi
+        fi
+    fi
+
+    if [ -n "$web_mode" ]; then
+        start_output_watch
+        meeting_log "Output watch started (web mode)"
+    fi
+
+    if [ -z "$web_mode" ]; then
+        # 対面会議モード: システム既定の入力デバイスを使用
+        local audio_device
+        audio_device=$(get_default_audio_device)
+        if [ -n "$audio_device" ]; then
+            local audio_ref="$audio_device"
+            local audio_index
+            audio_index="$(resolve_avfoundation_audio_index "$audio_device" || true)"
+            if [ -n "$audio_index" ]; then
+                meeting_log "Local input index: $audio_device -> $audio_index"
+                audio_ref="$audio_index"
+            fi
+            meeting_log "Local input device: $audio_device"
+            ffmpeg -f avfoundation -i ":$audio_ref" -acodec pcm_s16le -ar 16000 "$audio_file" > /dev/null 2>&1 &
+            recording_pid=$!
+        else
+            meeting_log "Local input device: fallback avfoundation index 0"
+            ffmpeg -f avfoundation -i ":0" -acodec pcm_s16le -ar 16000 "$audio_file" > /dev/null 2>&1 &
+            recording_pid=$!
+        fi
+    fi
+
+    local pid="$recording_pid"
+    if [ -z "$pid" ]; then
+        meeting_log "Error: recording pid not set"
+        echo -e "${RED}エラー: 録音の開始に失敗しました${NC}"
+        rm -f "$PID_FILE" "$INFO_FILE"
+        exit 1
+    fi
+    echo "$pid" > "$PID_FILE"
+    echo "${filename}|${meeting_name}|${category}|${source}|${platform}|${storage_area}|${project_name}" > "$INFO_FILE"
+    meeting_log "Recording started: pid=$pid info_file=$INFO_FILE"
+
+    sleep 1
+    if ps -p "$pid" > /dev/null 2>&1; then
+        local env_label="対面"
+        if [ "$web_requested" = "yes" ]; then
+            env_label="$(format_platform_label "$platform")"
+        fi
+        send_slack_start_notification "$meeting_name" "$env_label"
+        local slack_status=$?
+        case "$slack_status" in
+            0)
+                meeting_log "Slack start notification sent: env=${env_label}"
+                ;;
+            2)
+                meeting_log "Slack start notification skipped: env=${env_label}"
+                ;;
+            *)
+                meeting_log "Slack start notification failed: env=${env_label}"
+                ;;
+        esac
+        echo -e "${GREEN}  録音中... 🎙️${NC}"
+        echo ""
+        echo "  停止するには: meeting stop"
+        echo ""
+    else
+        echo -e "${RED}エラー: 録音の開始に失敗しました${NC}"
+        rm -f "$PID_FILE" "$INFO_FILE"
+        exit 1
+    fi
+}
+
+# 録音停止
+stop_recording() {
+    if [ ! -f "$PID_FILE" ]; then
+        echo -e "${RED}エラー: 録音中のセッションがありません${NC}"
+        exit 1
+    fi
+
+    local pid=$(cat "$PID_FILE")
+    local info
+    info="$(cat "$INFO_FILE")"
+    local filename=""
+    local meeting_name=""
+    local category=""
+    local source="manual"
+    local platform="unknown"
+    local storage_area=""
+    local project_name=""
+    IFS='|' read -r filename meeting_name category source platform storage_area project_name <<< "$info"
+    local start_ts
+    start_ts="$(get_recording_started_at)"
+    meeting_log "Stop requested: filename=$filename title=$meeting_name category=$category source=$source platform=$platform storage_area=${storage_area:-none} project=${project_name:-none}"
+    stop_output_watch
+    meeting_log "Output watch stopped (stop)"
+    # 文字起こし前に出力デバイスを元に戻す
+    restore_audio_output
+    meeting_log "Audio output restored (stop)"
+    if [ -z "$category" ]; then
+        category="社内"
+    fi
+    if [ -z "$storage_area" ]; then
+        if [ "$source" = "auto" ]; then
+            storage_area="auto"
+        elif [ "$category" = "$PRIVATE_CATEGORY" ]; then
+            storage_area="private"
+        elif [ "$category" = "商談" ] || [ "$category" = "社内" ]; then
+            storage_area="work"
+        elif [ "$STORAGE_MODE" = "auto" ]; then
+            storage_area="auto"
+        else
+            storage_area="work"
+        fi
+    fi
+    local audio_file="$TEMP_DIR/${filename}.wav"
+
+    echo ""
+    echo -e "${YELLOW}録音を停止しています...${NC}"
+
+    # ffmpegを停止（ヘッダ破損を避けるため猶予を長めに）
+    kill -INT "$pid" 2>/dev/null || true
+    local waited=0
+    while ps -p "$pid" > /dev/null 2>&1; do
+        sleep 1
+        waited=$((waited + 1))
+        if [ "$waited" -ge 10 ]; then
+            break
+        fi
+    done
+
+    if ps -p "$pid" > /dev/null 2>&1; then
+        meeting_log "Stop wait timed out (${waited}s), sending SIGTERM"
+        kill -TERM "$pid" 2>/dev/null || true
+        local waited_term=0
+        while ps -p "$pid" > /dev/null 2>&1; do
+            sleep 1
+            waited_term=$((waited_term + 1))
+            if [ "$waited_term" -ge 5 ]; then
+                break
+            fi
+        done
+    fi
+
+    if ps -p "$pid" > /dev/null 2>&1; then
+        local audio_size=""
+        if [ -f "$audio_file" ]; then
+            audio_size="$(stat -f%z "$audio_file" 2>/dev/null || true)"
+        fi
+        meeting_log "Stop wait timed out; SIGKILL may corrupt WAV (size=${audio_size:-unknown})"
+        echo -e "${YELLOW}警告: 録音プロセスの終了が遅れています。WAV破損の可能性があります${NC}"
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+
+    local duration_label="0s"
+    if [ -n "$start_ts" ]; then
+        local stop_ts
+        stop_ts="$(date +%s)"
+        local duration=$((stop_ts - start_ts))
+        if [ "$duration" -lt 0 ]; then
+            duration=0
+        fi
+        duration_label="$(format_duration "$duration")"
+    fi
+    send_slack_stop_notification "$duration_label"
+    local slack_status=$?
+    case "$slack_status" in
+        0)
+            meeting_log "Slack stop notification sent: duration=${duration_label}"
+            ;;
+        2)
+            meeting_log "Slack stop notification skipped: duration=${duration_label}"
+            ;;
+        *)
+            meeting_log "Slack stop notification failed: duration=${duration_label}"
+            ;;
+    esac
+
+    rm -f "$PID_FILE" "$INFO_FILE"
+
+    if [ ! -f "$audio_file" ]; then
+        meeting_log "Error: audio file not found ($audio_file)"
+        echo -e "${RED}エラー: 音声ファイルが見つかりません${NC}"
+        exit 1
+    fi
+
+    local file_size=$(ls -lh "$audio_file" | awk '{print $5}')
+    meeting_log "Recording stopped: file=$audio_file size=$file_size"
+    echo -e "${GREEN}録音完了${NC} (サイズ: $file_size)"
+    echo ""
+
+    local transcript_file="$TEMP_DIR/${filename}.txt"
+
+    if [ -f "$transcript_file" ]; then
+        meeting_log "Transcript reuse: $transcript_file"
+        echo -e "${YELLOW}既存の文字起こしを利用します...${NC}"
+        echo ""
+    else
+        # 文字起こし
+        meeting_log "Whisper start: model=small audio=$audio_file"
+        echo -e "${YELLOW}文字起こしを開始します...${NC}"
+        echo "（初回は数分かかる場合があります - モデルのダウンロードのため）"
+        echo ""
+
+        local whisper_bin=""
+        if ! whisper_bin="$(resolve_whisper)"; then
+            meeting_log "Error: whisper not found"
+            echo -e "${RED}文字起こしに失敗しました: whisper が見つかりません${NC}"
+            echo "対処: python3 -m pip install openai-whisper"
+            echo "音声ファイルは保持しました: $audio_file"
+            exit 1
+        fi
+
+        # smallモデルを使用（精度は少し下がるが処理が高速）
+        # 長い音声ファイルでも実用的な時間で処理可能
+        "$whisper_bin" "$audio_file" \
+            --language Japanese \
+            --model small \
+            --output_format txt \
+            --output_dir "$TEMP_DIR" \
+            2>/dev/null
+    fi
+
+    if [ ! -f "$transcript_file" ]; then
+        meeting_log "Error: transcript not found after whisper ($transcript_file)"
+        echo -e "${RED}文字起こしに失敗しました${NC}"
+        exit 1
+    fi
+
+    clean_transcript_file "$transcript_file"
+    meeting_log "Transcript ready: $transcript_file"
+
+    echo -e "${GREEN}文字起こし完了${NC}"
+    echo ""
+
+    # 会議メモMarkdownを生成
+    local date_display
+    date_display="$(echo "$filename" | cut -d'_' -f1)"
+    local date_compact="${date_display//-/}"
+    local transcript_content
+    transcript_content="$(cat "$transcript_file")"
+
+    LAST_MEETING_SUMMARY_GENERATED=0
+    LAST_MEETING_MD_FILE=""
+    create_meeting_memo "$transcript_content" "$meeting_name" "$category" "$source" "$platform" "$storage_area" "$project_name" "$date_display" "$transcript_file" ""
+
+    local summary_status="${LAST_MEETING_SUMMARY_STATUS:-unknown}"
+    local cleanup_allowed="$LAST_MEETING_SUMMARY_GENERATED"
+    if [ "$summary_status" = "skipped_short" ] && [ "$MEETING_DELETE_AUDIO_ON_SHORT" = "1" ]; then
+        cleanup_allowed=1
+    fi
+
+    if [ "$cleanup_allowed" -eq 1 ]; then
+        # Keep WAV when requested for audio quality checks.
+        if [ "$KEEP_AUDIO" != "1" ]; then
+            rm -f "$audio_file"
+        fi
+        rm -f "$transcript_file"
+    else
+        meeting_log "Summary missing (${summary_status}); keeping audio/transcript for reprocess: audio=$audio_file transcript=$transcript_file"
+        case "$summary_status" in
+            skipped_short)
+                echo -e "${YELLOW}文字起こしが短いため、要約を省略しました${NC}"
+                if [ "$MEETING_DELETE_AUDIO_ON_SHORT" = "1" ]; then
+                    echo "短い文字起こしでも録音を削除する設定です（MEETING_DELETE_AUDIO_ON_SHORT=1）。"
+                fi
+                ;;
+            no_cli)
+                echo -e "${YELLOW}要約ツールが見つからないため、要約を省略しました${NC}"
+                ;;
+            *)
+                echo -e "${YELLOW}要約生成に失敗したため、録音データと文字起こしを保持しました${NC}"
+                ;;
+        esac
+        echo "再処理: meeting reprocess \"$transcript_file\""
+    fi
+}
+
+reprocess_recording() {
+    local transcript_file="${1:-}"
+    if [ -z "$transcript_file" ] || [[ "$transcript_file" == --* ]]; then
+        echo -e "${RED}エラー: 文字起こしファイルを指定してください${NC}"
+        echo "例: meeting reprocess /path/to/transcript.txt --md /path/to/meeting.md"
+        exit 1
+    fi
+    shift
+
+    if [ ! -f "$transcript_file" ]; then
+        echo -e "${RED}エラー: 文字起こしファイルが見つかりません${NC}"
+        echo "パス: $transcript_file"
+        exit 1
+    fi
+
+    local meeting_name=""
+    local category="$AUTO_CATEGORY"
+    local source="reprocess"
+    local platform="unknown"
+    local storage_area="auto"
+    local project_name=""
+    local date_display=""
+    local existing_md=""
+    local replace_old="no"
+    local category_explicit="no"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --md)
+                existing_md="${2:-}"
+                shift 2
+                ;;
+            --title)
+                meeting_name="${2:-}"
+                shift 2
+                ;;
+            --date)
+                date_display="${2:-}"
+                shift 2
+                ;;
+            --replace)
+                replace_old="yes"
+                shift
+                ;;
+            --商談|--shoudan)
+                category="商談"
+                category_explicit="yes"
+                shift
+                ;;
+            --社内|--shanai)
+                category="社内"
+                category_explicit="yes"
+                shift
+                ;;
+            --プライベート|--private|--personal)
+                category="$PRIVATE_CATEGORY"
+                category_explicit="yes"
+                storage_area="private"
+                shift
+                ;;
+            --auto|--自動)
+                category="$AUTO_CATEGORY"
+                category_explicit="no"
+                storage_area="auto"
+                shift
+                ;;
+            --side-business|--sidebusiness|--個人事業)
+                storage_area="side-business"
+                if [ -n "${2:-}" ] && [[ "${2:-}" != --* ]]; then
+                    project_name="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                if [ "$category_explicit" != "yes" ]; then
+                    category="$PRIVATE_CATEGORY"
+                fi
+                ;;
+            --activity|--活動|--表現)
+                storage_area="activity"
+                if [ "$category_explicit" != "yes" ]; then
+                    category="$PRIVATE_CATEGORY"
+                fi
+                shift
+                ;;
+            --thoughts|--思想)
+                storage_area="thoughts"
+                if [ "$category_explicit" != "yes" ]; then
+                    category="$PRIVATE_CATEGORY"
+                fi
+                shift
+                ;;
+            --life|--日常|--生活)
+                storage_area="life"
+                if [ "$category_explicit" != "yes" ]; then
+                    category="$PRIVATE_CATEGORY"
+                fi
+                shift
+                ;;
+            --platform)
+                platform="${2:-unknown}"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    if [ -n "$existing_md" ] && [ ! -f "$existing_md" ]; then
+        echo -e "${YELLOW}警告: 指定された議事録が見つかりません: $existing_md${NC}"
+    fi
+
+    if [ -z "$date_display" ] && [ -n "$existing_md" ] && [ -f "$existing_md" ]; then
+        date_display="$(extract_date_from_md "$existing_md" || true)"
+    fi
+    if [ -z "$date_display" ]; then
+        date_display="$(extract_date_from_filename "$transcript_file" || true)"
+    fi
+    if [ -z "$date_display" ]; then
+        date_display="$(date '+%Y-%m-%d')"
+    fi
+    date_display="$(normalize_date_display "$date_display" || true)"
+    if [ -z "$date_display" ]; then
+        echo -e "${RED}エラー: 日付の解析に失敗しました${NC}"
+        exit 1
+    fi
+
+    if [ -z "$meeting_name" ] && [ -n "$existing_md" ] && [ -f "$existing_md" ]; then
+        meeting_name="$(extract_title_from_md "$existing_md" || true)"
+    fi
+    if [ -z "$meeting_name" ]; then
+        meeting_name="$(extract_title_from_filename "$transcript_file" || true)"
+    fi
+
+    local transcript_content
+    transcript_content="$(cat "$transcript_file")"
+    if [ -z "$transcript_content" ]; then
+        echo -e "${RED}エラー: 文字起こしファイルが空です${NC}"
+        exit 1
+    fi
+
+    meeting_log "Reprocess requested: transcript=$transcript_file md=${existing_md:-none} title=${meeting_name:-unknown} category=$category storage_area=$storage_area project=${project_name:-none}"
+
+    create_meeting_memo "$transcript_content" "$meeting_name" "$category" "$source" "$platform" "$storage_area" "$project_name" "$date_display" "$transcript_file" "$existing_md"
+
+    if [ -n "$existing_md" ] && [ -f "$existing_md" ] && [ "$existing_md" != "$LAST_MEETING_MD_FILE" ]; then
+        if [ "$replace_old" = "yes" ]; then
+            rm -f "$existing_md"
+            meeting_log "Reprocess: removed old memo: $existing_md"
+            echo -e "${GREEN}旧ファイルを削除しました: $existing_md${NC}"
+        else
+            meeting_log "Reprocess: old memo kept: $existing_md"
+            echo -e "${YELLOW}旧ファイルは残しています: $existing_md${NC}"
+            echo "必要なら削除/移動してください。"
+        fi
+    fi
+}
+
+# 録音一覧
+list_recordings() {
+    echo ""
+    echo "===== 会議メモ一覧 ====="
+    echo ""
+
+    echo -e "${BLUE}【商談】${NC}"
+    if ls "$BASE_DIR/商談"/*.md 2>/dev/null | head -1 > /dev/null; then
+        ls -lt "$BASE_DIR/商談"/*.md 2>/dev/null | head -10 | while read -r line; do
+            local file=$(echo "$line" | awk '{print $NF}')
+            local basename=$(basename "$file")
+            echo "  - $basename"
+        done
+    else
+        echo "  (なし)"
+    fi
+    echo ""
+
+    echo -e "${BLUE}【社内】${NC}"
+    if ls "$BASE_DIR/社内"/*.md 2>/dev/null | head -1 > /dev/null; then
+        ls -lt "$BASE_DIR/社内"/*.md 2>/dev/null | head -10 | while read -r line; do
+            local file=$(echo "$line" | awk '{print $NF}')
+            local basename=$(basename "$file")
+            echo "  - $basename"
+        done
+    else
+        echo "  (なし)"
+    fi
+    echo ""
+
+    echo -e "${BLUE}【未分類】${NC}"
+    if ls "$BASE_DIR"/*.md 2>/dev/null | head -1 > /dev/null; then
+        ls -lt "$BASE_DIR"/*.md 2>/dev/null | head -10 | while read -r line; do
+            local file=$(echo "$line" | awk '{print $NF}')
+            local basename=$(basename "$file")
+            echo "  - $basename"
+        done
+    else
+        echo "  (なし)"
+    fi
+    echo ""
+
+    echo -e "${BLUE}【プライベート】${NC}"
+    if ls "$PRIVATE_DIR"/*.md 2>/dev/null | head -1 > /dev/null; then
+        ls -lt "$PRIVATE_DIR"/*.md 2>/dev/null | head -10 | while read -r line; do
+            local file=$(echo "$line" | awk '{print $NF}')
+            local basename=$(basename "$file")
+            echo "  - $basename"
+        done
+    else
+        echo "  (なし)"
+    fi
+    echo ""
+
+    echo -e "${BLUE}【個人事業】${NC}"
+    if ls "$SIDE_BUSINESS_DIR"/*.md 2>/dev/null | head -1 > /dev/null; then
+        ls -lt "$SIDE_BUSINESS_DIR"/*.md 2>/dev/null | head -10 | while read -r line; do
+            local file=$(echo "$line" | awk '{print $NF}')
+            local basename=$(basename "$file")
+            echo "  - $basename"
+        done
+    else
+        echo "  (なし)"
+    fi
+    echo ""
+
+    echo -e "${BLUE}【表現活動】${NC}"
+    if ls "$ACTIVITIES_DIR"/*.md 2>/dev/null | head -1 > /dev/null; then
+        ls -lt "$ACTIVITIES_DIR"/*.md 2>/dev/null | head -10 | while read -r line; do
+            local file=$(echo "$line" | awk '{print $NF}')
+            local basename=$(basename "$file")
+            echo "  - $basename"
+        done
+    else
+        echo "  (なし)"
+    fi
+    echo ""
+
+    echo -e "${BLUE}【思想】${NC}"
+    if ls "$PRIVATE_THOUGHTS_DIR"/*.md 2>/dev/null | head -1 > /dev/null; then
+        ls -lt "$PRIVATE_THOUGHTS_DIR"/*.md 2>/dev/null | head -10 | while read -r line; do
+            local file=$(echo "$line" | awk '{print $NF}')
+            local basename=$(basename "$file")
+            echo "  - $basename"
+        done
+    else
+        echo "  (なし)"
+    fi
+    echo ""
+
+    echo -e "${BLUE}【日常】${NC}"
+    if ls "$PRIVATE_LIFE_DIR"/*.md 2>/dev/null | head -1 > /dev/null; then
+        ls -lt "$PRIVATE_LIFE_DIR"/*.md 2>/dev/null | head -10 | while read -r line; do
+            local file=$(echo "$line" | awk '{print $NF}')
+            local basename=$(basename "$file")
+            echo "  - $basename"
+        done
+    else
+        echo "  (なし)"
+    fi
+    echo ""
+}
+
+# メイン処理
+case "$1" in
+    start)
+        shift
+        start_recording "$@"
+        ;;
+    stop)
+        stop_recording
+        ;;
+    reprocess)
+        shift
+        reprocess_recording "$@"
+        ;;
+    list)
+        list_recordings
+        ;;
+    help|--help|-h)
+        show_help
+        ;;
+    *)
+        show_help
+        exit 1
+        ;;
+esac
