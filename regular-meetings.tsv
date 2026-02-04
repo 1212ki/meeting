@@ -1,16 +1,19 @@
 # canonical|aliases (comma-separated)
 g4BHub|g4B Hub,g4b hub,g4bHub,g4b HUB
 weekly-update|weekly update,all-company weekly,company weekly,shuji update,shuuji update
-oasis sprint meeting|oasis sprint,oasis sprint planning,oasis sprint pranning
-gSM anken suishin teirei|gSM anken teirei,gSM anken suishin,gSM biz teirei
-1on1 itsuki/yusaku|itsuki yusaku 1on1,1on1 itsuki yusaku
-JCB teirei|JCB regular,JCB sama teirei,JCB meeting
-oasis teirei|oasis regular,oasis weekly
-corporate gift teirei|corporategift teirei,corporate gift weekly,corporate gift regular
-1on1 itsuki/koshiro|itsuki koshiro 1on1,1on1 itsuki koshiro,itsuki yokono 1on1,1on1 itsuki yokono,itsuki yokono koshiro 1on1,1on1 itsuki yokono koshiro
-oasis dev morning|oasis dev standup,oasis dev daily,oasis dev morning standup,oasis dev asa-kai
-giftee <> leafea|giftee leafea,giftee x leafea,giftee-leafea,leafea regular
-gSM product teirei|gSM product regular,gSM prod teirei,gSM product meeting
+OASISスプリントプランニング|oasis sprint meeting,oasis sprint,oasis sprint planning,oasis sprint pranning
+gSM案件推進定例|gSM anken suishin teirei,gSM anken teirei,gSM anken suishin,gSM biz teirei
+1on1_Yusaku|itsuki yusaku 1on1,1on1 itsuki yusaku
+JCB定例|JCB teirei,JCB regular,JCB sama teirei,JCB meeting
+OASIS定例|oasis teirei,oasis regular,oasis weekly
+Corporate_Gift定例|corporate gift teirei,corporategift teirei,corporate gift weekly,corporate gift regular
+1on1_Koshiro|itsuki koshiro 1on1,1on1 itsuki koshiro,itsuki yokono 1on1,1on1 itsuki yokono,itsuki yokono koshiro 1on1,1on1 itsuki yokono koshiro
+OASIS_Dev朝会|oasis dev morning,oasis dev standup,oasis dev daily,oasis dev morning standup,oasis dev asa-kai
+Leafea定例|giftee <> leafea,giftee leafea,giftee x leafea,giftee-leafea,leafea regular
+gSMプロダクト定例|gSM product teirei,gSM product regular,gSM prod teirei,gSM product meeting
 oasis UI consult|oasis UI sodan,oasis UI consult slot,oasis UI sodan waku
-1on1 itsuki/P|itsuki P 1on1,1on1 itsuki P
+1on1_P|itsuki P 1on1,1on1 itsuki P
 oasis retrospective|oasis retro,oasis retro meeting
+AI_PJ定例|AI定例,AI PJ定例,AI PJ,AI teirei,AI PJ teirei,AIPJ定例
+gSMスプリントプランニング|gSM sprint planning,gSM sprint,gSM sprint pranning
+CS定例|CS teirei,CS regular,CS weekly
