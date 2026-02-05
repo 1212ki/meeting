@@ -41,6 +41,21 @@ tools/meeting/meeting import <memo.md>
 | `--プライベート` | `knowledge/meetings/private/` |
 | `--side-business` | `knowledge/meetings/side-business/` |
 
+## Codex CLI対応
+
+Codex CLIで使用する場合、以下のコマンドプレフィックスが `~/.codex/config.toml` で承認済みである必要がある：
+
+```toml
+approved_command_prefixes = [
+  ["tools/meeting/meeting", "start"],
+  ["tools/meeting/meeting", "stop"],
+  ["tools/meeting/meeting", "reprocess"],
+  ["tools/meeting/meeting", "import"]
+]
+```
+
+初回実行時に「Always allow」を選択しても承認される。
+
 ## 詳細
 
 - 詳細運用: `tools/meeting/agents.md`

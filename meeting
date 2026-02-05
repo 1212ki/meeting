@@ -1130,7 +1130,8 @@ process_transcript() {
     local summary_inline
     summary_inline="$(format_bullets_inline "$summary_text")"
 
-    send_complete_notification "$md_file" "$summary_inline" "$decisions_inline" "$todos_inline"
+    # Claudeが詳細な議事録通知を送るため、ツール側の通知は無効化
+    # send_complete_notification "$md_file" "$summary_inline" "$decisions_inline" "$todos_inline"
 
     SUMMARY_SUCCESS="$summary_generated"
     printf '%s' "$md_file"
@@ -1432,39 +1433,21 @@ process_recording() {
     fi
 
     echo -e "${GREEN}文字起こし完了${NC}"
+
+    # 議事録作成はClaudeに任せるため、文字起こしファイルのパスを表示して終了
+    echo ""
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}  文字起こしが完了しました${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "  会議名: ${BLUE}$meeting_name${NC}"
+    echo -e "  カテゴリ: ${BLUE}${category:-未分類}${NC}"
+    echo -e "  文字起こし: ${BLUE}$transcript_file${NC}"
     echo ""
 
-    local date_display
-    date_display="$(echo "$filename" | cut -d'_' -f1)"
+    log_message "INFO" "transcript completed: $transcript_file"
 
-    local skip_summary="0"
-    local transcript_len
-    transcript_len=$(wc -c < "$transcript_file" 2>/dev/null || echo 0)
-    if [ "$transcript_len" -lt "$SUMMARY_MIN_CHARS" ]; then
-        skip_summary="1"
-    fi
-
-    SUMMARY_SUCCESS="0"
-    local md_file
-    md_file="$(process_transcript "$transcript_file" "$meeting_name" "$category" "$storage_area" "$project_name" "$date_display" "$platform" "$skip_summary" "" "0")"
-
-    if [ -n "$md_file" ]; then
-        log_message "INFO" "meeting saved: $md_file"
-    fi
-
-    local summary_success="${SUMMARY_SUCCESS:-0}"
-
-    if [ "$skip_summary" = "1" ]; then
-        if [ "$DELETE_AUDIO_ON_SHORT" = "1" ]; then
-            rm -f "$audio_file" 2>/dev/null || true
-        fi
-        return 0
-    fi
-
-    if [ "$summary_success" != "1" ]; then
-        return 0
-    fi
-
+    # 音声ファイルの削除
     if [ "$KEEP_AUDIO" != "1" ]; then
         rm -f "$audio_file" 2>/dev/null || true
     fi
