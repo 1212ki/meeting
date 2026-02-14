@@ -37,7 +37,7 @@
 ### 対面会議
 
 ```sh
-meeting start "A社提案" --商談
+meeting start "A社提案"
 # ... 会議中 ...
 meeting stop
 ```
@@ -45,7 +45,7 @@ meeting stop
 ### Web会議
 
 ```sh
-meeting start "週次定例" --社内 --web --platform meet
+meeting start "週次定例" --web --platform meet
 # ... 会議中 ...
 meeting stop
 ```
@@ -55,6 +55,63 @@ meeting stop
 ```sh
 meeting stop --async  # 文字起こし/要約をバックグラウンドで実行
 ```
+
+## Windowsでの使い方
+
+WindowsではBash版（`tools/meeting/meeting`）ではなく、PowerShell版を使う。
+
+```powershell
+# 録音開始
+tools\meeting\meeting.cmd start "週次定例"
+
+# 停止 -> 文字起こし
+tools\meeting\meeting.cmd stop
+
+# 一覧
+tools\meeting\meeting.cmd list
+
+# デバイス確認
+tools\meeting\meeting.ps1 devices
+```
+
+`meeting.cmd` は `--web` 等のオプションをWindows向けに調整して `meeting.ps1` を呼び出す。
+
+### Windows依存
+
+- `ffmpeg`（録音）
+- `whisper` または `python -m whisper` / `py -3 -m whisper`（文字起こし）
+- 入力デバイス固定が必要なら `MEETING_WINDOWS_INPUT_DEVICE` を設定
+- `--web` 指定時:
+  - 相手音声: `MEETING_WEB_INPUT_DEVICE`（例: `CABLE Output (VB-Audio Virtual Cable)`）
+  - マイク: `MEETING_WEB_MIC_DEVICE`
+
+### WindowsでWeb会議を録る最短手順（VB-CABLE）
+
+1. VB-CABLEをインストールする
+2. 会議アプリのスピーカー出力を `CABLE Input (VB-Audio Virtual Cable)` にする
+3. 以下を設定する
+
+```powershell
+$env:MEETING_WEB_INPUT_DEVICE = "CABLE Output (VB-Audio Virtual Cable)"
+$env:MEETING_WEB_MIC_DEVICE = "マイク デバイス名"
+```
+
+4. 録音開始
+
+```powershell
+tools\meeting\meeting.cmd start "週次定例" --web --platform teams
+```
+
+5. 停止
+
+```powershell
+tools\meeting\meeting.cmd stop
+```
+
+補足:
+- `--web` は「相手音声 + マイク」の2入力ミックス録音を試みる
+- 片方しか見つからない場合は単一入力にフォールバックする
+- カテゴリは起動時に固定せず、停止後に文字起こし内容を見て判断する運用を推奨
 
 ### 副業プロジェクトの会議
 

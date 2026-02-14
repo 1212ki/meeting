@@ -11,9 +11,8 @@
 
 ```bash
 # 録音開始
-tools/meeting/meeting start "会議名" --社内
-tools/meeting/meeting start "会議名" --商談
-tools/meeting/meeting start "会議名" --社内 --web  # Web会議
+tools/meeting/meeting start "会議名"
+tools/meeting/meeting start "会議名" --web  # Web会議
 
 # 録音停止 → 文字起こし → 要約 → 保存 → Slack通知
 tools/meeting/meeting stop
@@ -23,14 +22,21 @@ tools/meeting/meeting reprocess <transcript.txt>
 
 # メモ取り込み
 tools/meeting/meeting import <memo.md>
+
+# Windows (PowerShell)
+tools/meeting/meeting.cmd start "会議名"
+tools/meeting/meeting.cmd start "会議名" --web
+tools/meeting/meeting.cmd stop
+tools/meeting/meeting.cmd list
 ```
 
 ## 運用ルール
 
 1. **即時実行**: 「議事録取って」「開始」等の指示は確認なしで即実行
 2. **Webオプション**: 「Web」「Meet」「Zoom」等の明示がある場合のみ `--web` を付ける
-3. **Slack通知**: 常に送信（確認不要）
-4. **タイムアウト**: start=10秒以上、stop=2時間以上
+3. **カテゴリ判定**: 起動時はカテゴリを固定せず、停止後に文字起こし内容を見てカテゴリ/保存先を判断・修正する
+4. **Slack通知**: 常に送信（確認不要）
+5. **タイムアウト**: start=10秒以上、stop=2時間以上
 
 ## カテゴリと保存先
 
