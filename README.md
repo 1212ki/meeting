@@ -10,6 +10,8 @@
 |---------|------|
 | `meeting start "会議名" --カテゴリ [--web] [--platform]` | 録音開始 |
 | `meeting stop [--async]` | 録音停止 → 文字起こし → 要約 → 保存 → Slack通知 |
+| `meeting setup-async` | Windowsの非同期runnerタスクを作成/確認 |
+| `meeting status` | 録音/文字起こしワーカーの状態を表示 |
 | `meeting list` | 録音一覧を表示 |
 | `meeting reprocess <transcript.txt>` | 既存文字起こしの再処理（分類/要約/通知を再実行） |
 | `meeting import <memo.md>` | コピペ文字起こしメモの取り込み |
@@ -67,6 +69,15 @@ tools\meeting\meeting.cmd start "週次定例"
 # 停止 -> 文字起こし
 tools\meeting\meeting.cmd stop
 
+# 停止（非同期） -> 文字起こしはバックグラウンド実行
+tools\meeting\meeting.cmd stop --async
+
+# 非同期runnerの初期化（初回または不調時）
+tools\meeting\meeting.cmd setup-async
+
+# 状態確認
+tools\meeting\meeting.cmd status
+
 # 一覧
 tools\meeting\meeting.cmd list
 
@@ -80,7 +91,11 @@ tools\meeting\meeting.ps1 devices
 
 - `ffmpeg`（録音）
 - `whisper` または `python -m whisper` / `py -3 -m whisper`（文字起こし）
-- 入力デバイス固定が必要なら `MEETING_WINDOWS_INPUT_DEVICE` を設定
+- 非Web録音の入力は `MEETING_WINDOWS_FORCE_INPUT_DEVICE` を優先（既定: `マイク (Logi C270 HD WebCam)`）
+- `stop --async` は Windows でも利用可能（進捗確認は `meeting status`）
+- `stop --async` は固定runnerタスク（`schtasks`）を使ってバックグラウンド実行する（PowerShell親プロセスから分離）
+- 初回またはタスク不調時は `meeting setup-async` を実行してrunnerを再作成する
+- 互換用に `MEETING_WINDOWS_INPUT_DEVICE` も参照（`MEETING_WINDOWS_FORCE_INPUT_DEVICE` 未設定時のみ）
 - `--web` 指定時:
   - 相手音声: `MEETING_WEB_INPUT_DEVICE`（例: `CABLE Output (VB-Audio Virtual Cable)`）
   - マイク: `MEETING_WEB_MIC_DEVICE`
@@ -268,3 +283,18 @@ meeting import /path/to/memo.md --社内
 
 - **start**: 10000ms以上を推奨（開始は即時だが初期処理で中断しないため）
 - **stop**: 7200000ms（2時間）以上を推奨（長尺会議のWhisper/後処理が長引くため）
+
+## 文字起こし負荷調整（Windows）
+
+- `MEETING_WHISPER_PRIORITY`（既定: `BelowNormal`）
+  - Whisperプロセス優先度。`Idle` / `BelowNormal` / `Normal` / `AboveNormal` / `High`
+- `MEETING_TRIM_SILENCE`（既定: `1`）
+  - 文字起こし前に保守的な無音トリミングを実施（先頭・末尾のみ）
+- `MEETING_TRIM_NOISE_DB`（既定: `-45`）
+  - 無音判定しきい値（dB）
+- `MEETING_TRIM_SILENCE_DURATION`（既定: `0.7`）
+  - 無音として判定する最小継続秒数
+- `MEETING_TRIM_TRAILING_MIN_SECONDS`（既定: `8`）
+  - 末尾無音をトリムする最小秒数
+- `MEETING_TRIM_LEADING_MAX_SECONDS`（既定: `10`）
+  - 先頭無音として削る上限秒数

@@ -37,6 +37,7 @@ tools/meeting/meeting.cmd list
 3. **カテゴリ判定**: 起動時はカテゴリを固定せず、停止後に文字起こし内容を見てカテゴリ/保存先を判断・修正する
 4. **Slack通知**: 常に送信（確認不要）
 5. **タイムアウト**: start=10秒以上、stop=2時間以上
+6. **Windows対面録音の入力固定**: 非Web録音は `MEETING_WINDOWS_FORCE_INPUT_DEVICE` を優先する（既定: `マイク (Logi C270 HD WebCam)`）。見つからない場合は開始を中止する。
 
 ## カテゴリと保存先
 

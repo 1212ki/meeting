@@ -17,6 +17,14 @@ $AudioDir = Join-Path $MeetingsDir "_audio"
 $LogDir = Join-Path $MeetingsDir "log"
 $PidFile = Join-Path $AudioDir ".recording.pid"
 $InfoFile = Join-Path $AudioDir ".recording.info"
+$TranscribePidFile = Join-Path $AudioDir ".transcribe.pid"
+$TranscribeInfoFile = Join-Path $AudioDir ".transcribe.info"
+$TranscribeTaskFile = Join-Path $AudioDir ".transcribe.task"
+$TranscribeJobFile = Join-Path $AudioDir ".transcribe.job.json"
+$TranscribeRunnerLogFile = Join-Path $AudioDir ".transcribe.runner.log"
+$AsyncRunnerDir = Join-Path $env:LOCALAPPDATA "CodexMeeting"
+$AsyncRunnerScript = Join-Path $AsyncRunnerDir "run-meeting-async.ps1"
+$ScriptPath = $MyInvocation.MyCommand.Path
 $CliArgs = @($CommandArgs)
 
 if ($env:MEETING_DEBUG -eq "1") {
@@ -56,11 +64,13 @@ function Get-ConfigValue {
 $KeepAudio = if ($env:MEETING_KEEP_AUDIO) { $env:MEETING_KEEP_AUDIO } else { "0" }
 $WhisperModel = if ($env:MEETING_WHISPER_MODEL) { $env:MEETING_WHISPER_MODEL } else { "small" }
 $WhisperLang = if ($env:MEETING_WHISPER_LANGUAGE) { $env:MEETING_WHISPER_LANGUAGE } else { "Japanese" }
+$WindowsForcedInputDevice = Get-ConfigValue -Name "MEETING_WINDOWS_FORCE_INPUT_DEVICE" -Default "マイク (Logi C270 HD WebCam)"
 $WebInputGainSystem = if ($env:MEETING_WEB_INPUT_GAIN_SYSTEM) { $env:MEETING_WEB_INPUT_GAIN_SYSTEM } elseif ($env:MEETING_WEB_INPUT_GAIN_BLACKHOLE) { $env:MEETING_WEB_INPUT_GAIN_BLACKHOLE } else { "1.0" }
 $WebInputGainMic = if ($env:MEETING_WEB_INPUT_GAIN_MIC) { $env:MEETING_WEB_INPUT_GAIN_MIC } else { "1.0" }
 $WebAutoLevel = if ($env:MEETING_WEB_AUTO_LEVEL) { $env:MEETING_WEB_AUTO_LEVEL } else { "1" }
 $WebLimiter = if ($env:MEETING_WEB_LIMITER) { $env:MEETING_WEB_LIMITER } else { "1" }
 $WebLimiterFilter = if ($env:MEETING_WEB_LIMITER_FILTER) { $env:MEETING_WEB_LIMITER_FILTER } else { "alimiter=limit=0.95:attack=5:release=50" }
+$TranscribeRunnerTaskName = Get-ConfigValue -Name "MEETING_TRANSCRIBE_TASK_NAME" -Default "CodexMeetingTranscribeRunner"
 
 function Ensure-Dirs {
     $dirs = @(
@@ -91,15 +101,20 @@ Meeting Recording Tool (Windows)
   .\tools\meeting\meeting.ps1 start "会議名" --社内
   .\tools\meeting\meeting.ps1 start "会議名" --社内 --web
   .\tools\meeting\meeting.ps1 stop [--async]
+  .\tools\meeting\meeting.ps1 setup-async
+  .\tools\meeting\meeting.ps1 status
   .\tools\meeting\meeting.ps1 list
   .\tools\meeting\meeting.ps1 devices
 
 補足:
   - Windows版は ffmpeg(dshow) で録音します
+  - 非Web録音は MEETING_WINDOWS_FORCE_INPUT_DEVICE（既定: マイク (Logi C270 HD WebCam)）を優先します
   - --web は「相手音声(VB-CABLE等) + マイク」の2入力ミックス録音です
   - 相手音声入力: MEETING_WEB_INPUT_DEVICE（例: CABLE Output (VB-Audio Virtual Cable)）
   - マイク入力: MEETING_WEB_MIC_DEVICE（未指定時はマイクらしいデバイスを自動選択）
   - 文字起こしは whisper / python -m whisper / py -3 -m whisper を順に探索します
+  - stop --async は停止後の文字起こしをバックグラウンド実行します（状態確認: status）
+  - --async は固定runnerタスク（schtasks）を使って PowerShell 親プロセスから分離起動します
 "@
 }
 
@@ -160,6 +175,25 @@ function Resolve-InputDevice {
     $devices = @(Get-DShowAudioDevices)
     if ($devices.Count -eq 0) {
         throw "録音デバイスが見つかりません。ffmpegのdshowデバイス一覧を確認してください。"
+    }
+
+    if (-not $WebMode) {
+        $forced = $WindowsForcedInputDevice
+        if (-not [string]::IsNullOrWhiteSpace($forced)) {
+            foreach ($d in $devices) {
+                if ($d -eq $forced) {
+                    return $d
+                }
+            }
+            foreach ($d in $devices) {
+                if ($d -like "*$forced*") {
+                    return $d
+                }
+            }
+
+            $found = $devices -join ", "
+            throw "固定入力デバイス '$forced' が見つかりません。接続またはデバイス名を確認してください。検出デバイス: $found"
+        }
     }
 
     $requested = ""
@@ -312,6 +346,375 @@ function ConvertTo-ProcessArgumentString {
     return ($quoted -join " ")
 }
 
+function Parse-IntOrDefault {
+    param(
+        [string]$Value,
+        [int]$Default
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $Default
+    }
+    $parsed = 0
+    if ([int]::TryParse($Value, [ref]$parsed)) {
+        return $parsed
+    }
+    return $Default
+}
+
+function Parse-DoubleOrDefault {
+    param(
+        [string]$Value,
+        [double]$Default
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $Default
+    }
+    $parsed = 0.0
+    if ([double]::TryParse($Value, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+        return $parsed
+    }
+    return $Default
+}
+
+function Format-Seconds {
+    param([double]$Value)
+    return [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, "{0:0.###}", $Value)
+}
+
+function Write-RunnerLog {
+    param([Parameter(Mandatory = $true)][string]$Message)
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Add-Content -LiteralPath $TranscribeRunnerLogFile -Value "[$ts] $Message" -Encoding UTF8
+}
+
+function Get-ProcessFromPidFile {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $null
+    }
+    $raw = Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        return $null
+    }
+    $pidValue = 0
+    if (-not [int]::TryParse($raw.Trim(), [ref]$pidValue)) {
+        return $null
+    }
+    return Get-Process -Id $pidValue -ErrorAction SilentlyContinue
+}
+
+function Clear-TranscribeState {
+    Remove-Item -LiteralPath $TranscribePidFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $TranscribeInfoFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $TranscribeTaskFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $TranscribeJobFile -Force -ErrorAction SilentlyContinue
+}
+
+function Remove-TaskSafe {
+    param([string]$TaskName)
+    if ([string]::IsNullOrWhiteSpace($TaskName)) {
+        return
+    }
+    & schtasks /Delete /TN $TaskName /F *> $null
+}
+
+function Test-TaskExists {
+    param([string]$TaskName)
+    if ([string]::IsNullOrWhiteSpace($TaskName)) {
+        return $false
+    }
+    & schtasks /Query /TN $TaskName *> $null
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Get-RunnerShellExecutable {
+    $pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
+    if (-not $pwsh) {
+        throw "pwsh が見つかりません。stop --async には PowerShell 7 (pwsh) が必要です。"
+    }
+    return $pwsh.Source
+}
+
+function Ensure-AsyncRunnerScript {
+    if (-not (Test-Path -LiteralPath $AsyncRunnerDir)) {
+        New-Item -ItemType Directory -Path $AsyncRunnerDir -Force | Out-Null
+    }
+
+    $escapedScriptPath = $ScriptPath -replace "'", "''"
+    $escapedJobPath = $TranscribeJobFile -replace "'", "''"
+    $content = @(
+        '$ErrorActionPreference = ''Stop'''
+        'try {'
+        '  & ''' + $escapedScriptPath + ''' _process-job ''' + $escapedJobPath + ''''
+        '  exit 0'
+        '} catch {'
+        '  Write-Error $_'
+        '  exit 1'
+        '}'
+    )
+    Set-Content -LiteralPath $AsyncRunnerScript -Value $content -Encoding Unicode
+}
+
+function Ensure-TranscribeRunnerTask {
+    Ensure-AsyncRunnerScript
+    $runnerExe = Get-RunnerShellExecutable
+
+    if (Test-TaskExists -TaskName $TranscribeRunnerTaskName) {
+        $queryText = (& schtasks /Query /TN $TranscribeRunnerTaskName /V /FO LIST 2>&1 | Out-String)
+        if ($LASTEXITCODE -eq 0 -and $queryText -like "*$AsyncRunnerScript*" -and $queryText -like "*$runnerExe*") {
+            return
+        }
+        Remove-TaskSafe -TaskName $TranscribeRunnerTaskName
+    }
+
+    $taskCommand = "`"$runnerExe`" -NoProfile -ExecutionPolicy Bypass -File `"$AsyncRunnerScript`""
+    $createOutput = (& schtasks /Create /TN $TranscribeRunnerTaskName /SC ONCE /SD 2099/12/31 /ST 23:59 /TR $taskCommand /F 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        if ([string]::IsNullOrWhiteSpace($createOutput)) {
+            throw "runnerタスクの作成に失敗しました。"
+        }
+        throw "runnerタスクの作成に失敗しました: $createOutput"
+    }
+}
+
+function Start-TranscriptionWorkerViaTaskScheduler {
+    param(
+        [Parameter(Mandatory = $true)][string]$AudioFile,
+        [Parameter(Mandatory = $true)][string]$Filename,
+        [Parameter(Mandatory = $true)][string]$MeetingName,
+        [string]$Category = ""
+    )
+
+    Ensure-TranscribeRunnerTask
+
+    $payload = @{
+        audioFile = $AudioFile
+        filename = $Filename
+        meetingName = $MeetingName
+        category = $Category
+        taskName = $TranscribeRunnerTaskName
+    } | ConvertTo-Json -Compress
+    Set-Content -LiteralPath $TranscribeJobFile -Value $payload -Encoding UTF8
+
+    $runOutput = (& schtasks /Run /TN $TranscribeRunnerTaskName 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        if ([string]::IsNullOrWhiteSpace($runOutput)) {
+            throw "非同期タスクの起動に失敗しました。"
+        }
+        throw "非同期タスクの起動に失敗しました: $runOutput"
+    }
+
+    Set-Content -LiteralPath $TranscribeTaskFile -Value $TranscribeRunnerTaskName -Encoding UTF8
+    $meta = "会議名=$MeetingName / 音声=$AudioFile / task=$TranscribeRunnerTaskName / job=$TranscribeJobFile"
+    Set-Content -LiteralPath $TranscribeInfoFile -Value $meta -Encoding UTF8
+
+    Write-Host "文字起こしをバックグラウンドで開始しました (Task=$TranscribeRunnerTaskName)"
+    Write-Host "状態確認: .\tools\meeting\meeting.ps1 status"
+}
+
+function Resolve-WhisperPriorityClass {
+    $raw = Get-ConfigValue -Name "MEETING_WHISPER_PRIORITY" -Default "BelowNormal"
+    switch ($raw.ToLowerInvariant()) {
+        "idle" { return [System.Diagnostics.ProcessPriorityClass]::Idle }
+        "belownormal" { return [System.Diagnostics.ProcessPriorityClass]::BelowNormal }
+        "normal" { return [System.Diagnostics.ProcessPriorityClass]::Normal }
+        "abovenormal" { return [System.Diagnostics.ProcessPriorityClass]::AboveNormal }
+        "high" { return [System.Diagnostics.ProcessPriorityClass]::High }
+        default {
+            Write-Warning "MEETING_WHISPER_PRIORITY='$raw' は不正なため BelowNormal を使用します。"
+            return [System.Diagnostics.ProcessPriorityClass]::BelowNormal
+        }
+    }
+}
+
+function Set-ProcessPrioritySafe {
+    param(
+        [Parameter(Mandatory = $true)]$Process,
+        [Parameter(Mandatory = $true)][System.Diagnostics.ProcessPriorityClass]$PriorityClass,
+        [string]$Context = "process"
+    )
+
+    try {
+        if (-not $Process.HasExited) {
+            $Process.PriorityClass = $PriorityClass
+        }
+    } catch {
+        Write-Warning "$Context の優先度設定に失敗しました: $($_.Exception.Message)"
+    }
+}
+
+function Get-AudioDurationSeconds {
+    param([Parameter(Mandatory = $true)][string]$AudioFile)
+
+    $durationRaw = ""
+    try {
+        $durationRaw = (& ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 $AudioFile 2>$null | Select-Object -First 1)
+    } catch {
+        return 0.0
+    }
+    if ([string]::IsNullOrWhiteSpace($durationRaw)) {
+        return 0.0
+    }
+    $duration = 0.0
+    if ([double]::TryParse($durationRaw.Trim(), [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$duration)) {
+        return $duration
+    }
+    return 0.0
+}
+
+function Prepare-AudioForTranscription {
+    param(
+        [Parameter(Mandatory = $true)][string]$AudioFile,
+        [Parameter(Mandatory = $true)][string]$Filename
+    )
+
+    $trimEnabled = Parse-IntOrDefault -Value (Get-ConfigValue -Name "MEETING_TRIM_SILENCE" -Default "1") -Default 1
+    if ($trimEnabled -ne 1) {
+        return @{
+            Path = $AudioFile
+            WasTrimmed = $false
+            LeadTrim = 0.0
+            TailTrim = 0.0
+        }
+    }
+
+    $noiseDb = Parse-DoubleOrDefault -Value (Get-ConfigValue -Name "MEETING_TRIM_NOISE_DB" -Default "-45") -Default -45.0
+    $silenceMin = Parse-DoubleOrDefault -Value (Get-ConfigValue -Name "MEETING_TRIM_SILENCE_DURATION" -Default "0.7") -Default 0.7
+    $trailingMin = Parse-DoubleOrDefault -Value (Get-ConfigValue -Name "MEETING_TRIM_TRAILING_MIN_SECONDS" -Default "8") -Default 8.0
+    $leadingMax = Parse-DoubleOrDefault -Value (Get-ConfigValue -Name "MEETING_TRIM_LEADING_MAX_SECONDS" -Default "10") -Default 10.0
+
+    $duration = Get-AudioDurationSeconds -AudioFile $AudioFile
+    if ($duration -le 0.0) {
+        return @{
+            Path = $AudioFile
+            WasTrimmed = $false
+            LeadTrim = 0.0
+            TailTrim = 0.0
+        }
+    }
+
+    $noiseSpec = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, "{0:0.###}dB", $noiseDb)
+    $minSpec = Format-Seconds -Value $silenceMin
+    $detectFilter = "silencedetect=noise=$noiseSpec:d=$minSpec"
+    $detectLines = @()
+    try {
+        $detectLines = & ffmpeg -hide_banner -i $AudioFile -af $detectFilter -f null NUL 2>&1
+    } catch {
+        return @{
+            Path = $AudioFile
+            WasTrimmed = $false
+            LeadTrim = 0.0
+            TailTrim = 0.0
+        }
+    }
+
+    $silenceStarts = New-Object System.Collections.Generic.List[double]
+    $silenceEnds = New-Object System.Collections.Generic.List[double]
+    foreach ($line in $detectLines) {
+        if ($line -match 'silence_start:\s*([0-9.]+)') {
+            $value = 0.0
+            if ([double]::TryParse($matches[1], [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$value)) {
+                $silenceStarts.Add($value)
+            }
+        }
+        if ($line -match 'silence_end:\s*([0-9.]+)') {
+            $value = 0.0
+            if ([double]::TryParse($matches[1], [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$value)) {
+                $silenceEnds.Add($value)
+            }
+        }
+    }
+
+    $leadTrim = 0.0
+    if ($silenceStarts.Count -gt 0 -and [math]::Abs($silenceStarts[0]) -lt 0.05 -and $silenceEnds.Count -gt 0) {
+        $candidate = $silenceEnds[0]
+        if ($candidate -ge 0.5 -and $candidate -le $leadingMax) {
+            $leadTrim = $candidate
+        }
+    }
+
+    $tailTrim = 0.0
+    $trimEnd = $duration
+    if ($silenceStarts.Count -gt 0) {
+        $lastStart = $silenceStarts[$silenceStarts.Count - 1]
+        $lastEnd = -1.0
+        if ($silenceEnds.Count -gt 0) {
+            $lastEnd = $silenceEnds[$silenceEnds.Count - 1]
+        }
+        $silenceToEnd = [math]::Max(0.0, $duration - $lastStart)
+        $tailLooksTrailing = ($lastEnd -le $lastStart) -or ([math]::Abs($duration - $lastEnd) -le 1.0)
+        if ($silenceToEnd -ge $trailingMin -and $tailLooksTrailing) {
+            $tailTrim = $silenceToEnd
+            $trimEnd = $lastStart
+        }
+    }
+
+    if ($leadTrim -le 0.0 -and $tailTrim -le 0.0) {
+        return @{
+            Path = $AudioFile
+            WasTrimmed = $false
+            LeadTrim = 0.0
+            TailTrim = 0.0
+        }
+    }
+
+    $trimmedDuration = $trimEnd - $leadTrim
+    if ($trimmedDuration -lt 10.0 -or $trimmedDuration -ge $duration) {
+        return @{
+            Path = $AudioFile
+            WasTrimmed = $false
+            LeadTrim = 0.0
+            TailTrim = 0.0
+        }
+    }
+
+    $trimmedFile = Join-Path $AudioDir "${Filename}.transcribe.wav"
+    Remove-Item -LiteralPath $trimmedFile -Force -ErrorAction SilentlyContinue
+
+    $startSpec = Format-Seconds -Value $leadTrim
+    $endSpec = Format-Seconds -Value $trimEnd
+    $trimFilter = "atrim=start=$startSpec:end=$endSpec,asetpts=PTS-STARTPTS"
+    try {
+        & ffmpeg -y -i $AudioFile -af $trimFilter -acodec pcm_s16le -ar 16000 $trimmedFile *> $null
+    } catch {
+        return @{
+            Path = $AudioFile
+            WasTrimmed = $false
+            LeadTrim = 0.0
+            TailTrim = 0.0
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $trimmedFile)) {
+        return @{
+            Path = $AudioFile
+            WasTrimmed = $false
+            LeadTrim = 0.0
+            TailTrim = 0.0
+        }
+    }
+    $trimmedSize = (Get-Item -LiteralPath $trimmedFile).Length
+    if ($trimmedSize -le 0) {
+        Remove-Item -LiteralPath $trimmedFile -Force -ErrorAction SilentlyContinue
+        return @{
+            Path = $AudioFile
+            WasTrimmed = $false
+            LeadTrim = 0.0
+            TailTrim = 0.0
+        }
+    }
+
+    return @{
+        Path = $trimmedFile
+        WasTrimmed = $true
+        LeadTrim = $leadTrim
+        TailTrim = $tailTrim
+    }
+}
+
 function Resolve-WhisperRunner {
     if ($env:MEETING_WHISPER_BIN) {
         return @{ File = $env:MEETING_WHISPER_BIN; Prefix = @() }
@@ -341,10 +744,28 @@ function Invoke-Whisper {
         $AudioFile,
         "--language", $WhisperLang,
         "--model", $WhisperModel,
+        "--verbose", "False",
         "--output_format", "txt",
         "--output_dir", $OutputDir
     )
-    & $runner.File @args
+    $argString = ConvertTo-ProcessArgumentString -ArgList $args
+    $origPythonIoEncoding = $env:PYTHONIOENCODING
+    $env:PYTHONIOENCODING = "utf-8"
+    try {
+        $proc = Start-Process -FilePath $runner.File -ArgumentList $argString -WindowStyle Hidden -PassThru
+        $priorityClass = Resolve-WhisperPriorityClass
+        Set-ProcessPrioritySafe -Process $proc -PriorityClass $priorityClass -Context "Whisper"
+        $proc.WaitForExit()
+        if ($proc.ExitCode -ne 0) {
+            throw "文字起こしに失敗しました (exit=$($proc.ExitCode))。"
+        }
+    } finally {
+        if ($null -eq $origPythonIoEncoding) {
+            Remove-Item Env:PYTHONIOENCODING -ErrorAction SilentlyContinue
+        } else {
+            $env:PYTHONIOENCODING = $origPythonIoEncoding
+        }
+    }
 }
 
 function Sanitize-FileName {
@@ -430,6 +851,24 @@ function Parse-StartOptions {
     }
 
     return $result
+}
+
+function Has-Flag {
+    param(
+        [string[]]$Args,
+        [Parameter(Mandatory = $true)][string]$LongFlag
+    )
+
+    if ($Args -contains $LongFlag) {
+        return $true
+    }
+    if ($LongFlag.StartsWith("--")) {
+        $shortStyle = "-" + $LongFlag.Substring(2)
+        if ($Args -contains $shortStyle) {
+            return $true
+        }
+    }
+    return $false
 }
 
 function Start-Recording {
@@ -557,12 +996,33 @@ function Process-Recording {
     )
 
     Write-Host "文字起こしを開始します..."
-    Invoke-Whisper -AudioFile $AudioFile -OutputDir $AudioDir
-
-    $transcriptFile = Join-Path $AudioDir "${Filename}.txt"
-    if (-not (Test-Path -LiteralPath $transcriptFile)) {
-        throw "文字起こしファイルが生成されませんでした: $transcriptFile"
+    $prepared = Prepare-AudioForTranscription -AudioFile $AudioFile -Filename $Filename
+    $audioForWhisper = [string]$prepared.Path
+    $cleanupTrimmedFile = ""
+    if ($prepared.WasTrimmed) {
+        $cleanupTrimmedFile = $audioForWhisper
+        $leadSec = Format-Seconds -Value ([double]$prepared.LeadTrim)
+        $tailSec = Format-Seconds -Value ([double]$prepared.TailTrim)
+        Write-Host "  無音トリミング: 先頭 ${leadSec}s / 末尾 ${tailSec}s"
     }
+
+    try {
+        Invoke-Whisper -AudioFile $audioForWhisper -OutputDir $AudioDir
+    } finally {
+        if ($cleanupTrimmedFile -and (Test-Path -LiteralPath $cleanupTrimmedFile)) {
+            Remove-Item -LiteralPath $cleanupTrimmedFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $actualTranscriptFile = Join-Path $AudioDir ("{0}.txt" -f [System.IO.Path]::GetFileNameWithoutExtension($audioForWhisper))
+    $transcriptFile = Join-Path $AudioDir "${Filename}.txt"
+    if (-not (Test-Path -LiteralPath $actualTranscriptFile)) {
+        throw "文字起こしファイルが生成されませんでした: $actualTranscriptFile"
+    }
+    if ($actualTranscriptFile -ne $transcriptFile) {
+        Move-Item -LiteralPath $actualTranscriptFile -Destination $transcriptFile -Force
+    }
+
     $transcriptSize = (Get-Item -LiteralPath $transcriptFile).Length
     if ($transcriptSize -eq 0) {
         throw "文字起こし結果が空でした。録音音声を保持したので確認してください: $AudioFile"
@@ -577,6 +1037,72 @@ function Process-Recording {
     if ($KeepAudio -ne "1" -and (Test-Path -LiteralPath $AudioFile)) {
         Remove-Item -LiteralPath $AudioFile -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Show-Status {
+    $recordingProc = Get-ProcessFromPidFile -Path $PidFile
+    $transcribeProc = Get-ProcessFromPidFile -Path $TranscribePidFile
+    $taskName = ""
+    if (Test-Path -LiteralPath $TranscribeTaskFile) {
+        $taskName = Get-Content -LiteralPath $TranscribeTaskFile -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+    if ((-not $transcribeProc) -and (-not [string]::IsNullOrWhiteSpace($taskName))) {
+        if (-not (Test-TaskExists -TaskName $taskName)) {
+            $taskName = ""
+            Clear-TranscribeState
+        }
+    }
+
+    if ((-not $transcribeProc) -and ([string]::IsNullOrWhiteSpace($taskName)) -and ((Test-Path -LiteralPath $TranscribePidFile) -or (Test-Path -LiteralPath $TranscribeInfoFile))) {
+        Clear-TranscribeState
+    }
+
+    Write-Host ""
+    Write-Host "===== meeting status ====="
+    if ($recordingProc) {
+        Write-Host "録音: 実行中 (PID=$($recordingProc.Id))"
+    } else {
+        Write-Host "録音: 停止中"
+    }
+
+    if ($transcribeProc) {
+        Write-Host "文字起こし: 実行中 (PID=$($transcribeProc.Id))"
+        $info = Get-Content -LiteralPath $TranscribeInfoFile -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not [string]::IsNullOrWhiteSpace($info)) {
+            Write-Host "対象: $info"
+        }
+    } elseif (-not [string]::IsNullOrWhiteSpace($taskName)) {
+        Write-Host "文字起こし: 起動中/実行中 (Task=$taskName)"
+        $info = Get-Content -LiteralPath $TranscribeInfoFile -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not [string]::IsNullOrWhiteSpace($info)) {
+            Write-Host "対象: $info"
+        }
+    } else {
+        Write-Host "文字起こし: 停止中"
+    }
+    Write-Host ""
+}
+
+function Start-TranscriptionWorker {
+    param(
+        [Parameter(Mandatory = $true)][string]$AudioFile,
+        [Parameter(Mandatory = $true)][string]$Filename,
+        [Parameter(Mandatory = $true)][string]$MeetingName,
+        [string]$Category = ""
+    )
+
+    $running = Get-ProcessFromPidFile -Path $TranscribePidFile
+    if ($running) {
+        throw "既に文字起こし処理中です (PID=$($running.Id))。status で確認してください。"
+    }
+    Clear-TranscribeState
+    Start-TranscriptionWorkerViaTaskScheduler -AudioFile $AudioFile -Filename $Filename -MeetingName $MeetingName -Category $Category
+}
+
+function Setup-AsyncRunner {
+    Ensure-Dirs
+    Ensure-TranscribeRunnerTask
+    Write-Host "非同期runnerタスクを確認しました: $TranscribeRunnerTaskName"
 }
 
 function Stop-Recording {
@@ -638,7 +1164,8 @@ function Stop-Recording {
     }
 
     if ($Async) {
-        Write-Warning "Windows版では --async は未対応のため同期処理します。"
+        Start-TranscriptionWorker -AudioFile $audioFile -Filename $filename -MeetingName $meetingName -Category $category
+        return
     }
 
     Process-Recording -AudioFile $audioFile -Filename $filename -MeetingName $meetingName -Category $category
@@ -684,7 +1211,81 @@ try {
             Start-Recording -MeetingName $meetingName -StartArgs $rest
         }
         "stop" {
-            Stop-Recording -Async:($CliArgs -contains "--async")
+            Stop-Recording -Async:(Has-Flag -Args $CliArgs -LongFlag "--async")
+        }
+        "status" {
+            Show-Status
+        }
+        "_process" {
+            if ($CliArgs.Count -lt 3) {
+                throw "_process の引数が不足しています。"
+            }
+            $audioFile = $CliArgs[0]
+            $filename = $CliArgs[1]
+            $meetingName = $CliArgs[2]
+            $category = ""
+            if ($CliArgs.Count -ge 4) {
+                $category = $CliArgs[3]
+            }
+            $taskName = ""
+            if ($CliArgs.Count -ge 5) {
+                $taskName = $CliArgs[4]
+            }
+            Set-Content -LiteralPath $TranscribePidFile -Value $PID -Encoding UTF8
+            if (-not [string]::IsNullOrWhiteSpace($taskName)) {
+                Set-Content -LiteralPath $TranscribeTaskFile -Value $taskName -Encoding UTF8
+            }
+            try {
+                Write-RunnerLog "_process start filename=$filename"
+                Process-Recording -AudioFile $audioFile -Filename $filename -MeetingName $meetingName -Category $category
+                Write-RunnerLog "_process completed filename=$filename"
+            } catch {
+                Write-RunnerLog "_process failed filename=$filename error=$($_.Exception.Message)"
+                throw
+            } finally {
+                if ((-not [string]::IsNullOrWhiteSpace($taskName)) -and ($taskName -ne $TranscribeRunnerTaskName)) {
+                    Remove-TaskSafe -TaskName $taskName
+                }
+                Clear-TranscribeState
+            }
+        }
+        "_process-job" {
+            Write-RunnerLog "_process-job invoked args=$($CliArgs -join ' | ')"
+            if ($CliArgs.Count -lt 1) {
+                throw "_process-job の引数が不足しています。"
+            }
+            $jobFile = $CliArgs[0]
+            if (-not (Test-Path -LiteralPath $jobFile)) {
+                throw "ジョブファイルが見つかりません: $jobFile"
+            }
+            $raw = Get-Content -LiteralPath $jobFile -Raw -ErrorAction Stop
+            $job = $raw | ConvertFrom-Json
+            $audioFile = [string]$job.audioFile
+            $filename = [string]$job.filename
+            $meetingName = [string]$job.meetingName
+            $category = [string]$job.category
+            $taskName = [string]$job.taskName
+            Set-Content -LiteralPath $TranscribePidFile -Value $PID -Encoding UTF8
+            if (-not [string]::IsNullOrWhiteSpace($taskName)) {
+                Set-Content -LiteralPath $TranscribeTaskFile -Value $taskName -Encoding UTF8
+            }
+            try {
+                Write-RunnerLog "_process-job start filename=$filename task=$taskName"
+                Process-Recording -AudioFile $audioFile -Filename $filename -MeetingName $meetingName -Category $category
+                Write-RunnerLog "_process-job completed filename=$filename"
+            } catch {
+                Write-RunnerLog "_process-job failed filename=$filename error=$($_.Exception.Message)"
+                throw
+            } finally {
+                if ((-not [string]::IsNullOrWhiteSpace($taskName)) -and ($taskName -ne $TranscribeRunnerTaskName)) {
+                    Remove-TaskSafe -TaskName $taskName
+                }
+                Remove-Item -LiteralPath $jobFile -Force -ErrorAction SilentlyContinue
+                Clear-TranscribeState
+            }
+        }
+        "setup-async" {
+            Setup-AsyncRunner
         }
         "list" {
             List-Recordings
@@ -707,6 +1308,13 @@ try {
         }
     }
 } catch {
+    if ($Command -eq "_process-job" -or $Command -eq "_process") {
+        try {
+            Write-RunnerLog "command=$Command failed: $($_.Exception.Message)"
+        } catch {
+            # no-op
+        }
+    }
     Write-Host "エラー: $($_.Exception.Message)" -ForegroundColor Red
     exit 1
 }
