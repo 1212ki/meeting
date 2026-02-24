@@ -234,11 +234,14 @@ meeting import /path/to/memo.md --社内
 | `MEETING_WEB_MIC_DEVICE_EARPHONE` | イヤホン時のマイクデバイス名 |
 | `MEETING_WEB_INPUT_GAIN_BLACKHOLE` | BlackHole入力ゲイン |
 | `MEETING_WEB_INPUT_GAIN_MIC` | マイク入力ゲイン |
+| `MEETING_WEB_MIC_FILTER` | Web録音時にマイクへ適用するFFmpegフィルタ（既定: `highpass=f=120,lowpass=f=7000`） |
 | `MEETING_WEB_AUTO_LEVEL` | 自動レベル調整（既定ON） |
 | `MEETING_WEB_LIMITER` | クリップ防止リミッタ（既定ON） |
 | `MEETING_WEB_OUTPUT_DEVICE` | 出力デバイス名（未指定/autoで自動選択） |
 | `MEETING_WEB_OUTPUT_AUTO_SWITCH` | 出力自動切替（1で有効） |
 | `MEETING_WEB_OUTPUT_POLL_INTERVAL` | 出力自動切替の監視頻度（秒、既定: 5） |
+| `MEETING_WHISPER_CONDITION_ON_PREVIOUS_TEXT` | 文脈引き継ぎ有無（既定: `False`、長尺での繰り返し抑制向け） |
+| `MEETING_WHISPER_TEMPERATURE_INCREMENT_ON_FALLBACK` | 失敗時の温度上昇幅（既定: `None`、揺れ抑制向け） |
 
 ## 録音ファイル
 

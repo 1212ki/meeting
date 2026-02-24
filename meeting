@@ -39,6 +39,8 @@ RECORDING_MIN_BYTES="${MEETING_RECORDING_MIN_BYTES:-1024}"
 WHISPER_MODEL="${MEETING_WHISPER_MODEL:-small}"
 WHISPER_LANG="${MEETING_WHISPER_LANGUAGE:-Japanese}"
 WHISPER_BIN="${MEETING_WHISPER_BIN:-${WHISPER_PATH:-}}"
+WHISPER_CONDITION_ON_PREVIOUS_TEXT="${MEETING_WHISPER_CONDITION_ON_PREVIOUS_TEXT:-False}"
+WHISPER_TEMPERATURE_INCREMENT_ON_FALLBACK="${MEETING_WHISPER_TEMPERATURE_INCREMENT_ON_FALLBACK:-None}"
 
 MEETING_AUDIO_EARPHONE="${MEETING_AUDIO_EARPHONE:-会議用イヤホン}"
 MEETING_AUDIO_SPEAKER="${MEETING_AUDIO_SPEAKER:-会議用スピーカー}"
@@ -49,6 +51,7 @@ MEETING_WEB_MIC_DEVICE="${MEETING_WEB_MIC_DEVICE:-}"
 MEETING_WEB_MIC_DEVICE_EARPHONE="${MEETING_WEB_MIC_DEVICE_EARPHONE:-}"
 MEETING_WEB_INPUT_GAIN_BLACKHOLE="${MEETING_WEB_INPUT_GAIN_BLACKHOLE:-1.0}"
 MEETING_WEB_INPUT_GAIN_MIC="${MEETING_WEB_INPUT_GAIN_MIC:-1.0}"
+MEETING_WEB_MIC_FILTER="${MEETING_WEB_MIC_FILTER:-highpass=f=120,lowpass=f=7000}"
 MEETING_WEB_AUTO_LEVEL="${MEETING_WEB_AUTO_LEVEL:-1}"
 MEETING_WEB_LIMITER="${MEETING_WEB_LIMITER:-1}"
 MEETING_WEB_LIMITER_FILTER="${MEETING_WEB_LIMITER_FILTER:-alimiter=limit=0.95:attack=5:release=50}"
@@ -723,6 +726,8 @@ run_whisper() {
     $whisper_cmd "$audio_file" \
         --language "$WHISPER_LANG" \
         --model "$WHISPER_MODEL" \
+        --condition_on_previous_text "$WHISPER_CONDITION_ON_PREVIOUS_TEXT" \
+        --temperature_increment_on_fallback "$WHISPER_TEMPERATURE_INCREMENT_ON_FALLBACK" \
         --output_format txt \
         --output_dir "$output_dir" \
         2>/dev/null
@@ -1444,7 +1449,7 @@ start_recording() {
         mic_index="$(resolve_avfoundation_index "$mic_device" "$avfoundation_devices" || true)"
 
         if [ -n "$blackhole_index" ] && [ -n "$mic_index" ] && [ "$blackhole_index" != "$mic_index" ]; then
-            local filter="[0:a]volume=${MEETING_WEB_INPUT_GAIN_BLACKHOLE}[bh];[1:a]volume=${MEETING_WEB_INPUT_GAIN_MIC}[mic];[bh][mic]amix=inputs=2:duration=longest:dropout_transition=2[mix]"
+            local filter="[0:a]volume=${MEETING_WEB_INPUT_GAIN_BLACKHOLE}[bh];[1:a]${MEETING_WEB_MIC_FILTER},volume=${MEETING_WEB_INPUT_GAIN_MIC}[mic];[bh][mic]amix=inputs=2:duration=longest:dropout_transition=2[mix]"
             if [ "$MEETING_WEB_LIMITER" = "1" ]; then
                 filter+=";[mix]${MEETING_WEB_LIMITER_FILTER}[out]"
             else
