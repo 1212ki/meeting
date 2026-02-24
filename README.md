@@ -1,19 +1,19 @@
 # Meeting Recording Tool
 
-録音 → 文字起こし → 要約 → 議事録保存 → Slack通知を一括で行うローカルツール。
+録音 → 文字起こし（.txt保存）を行うローカルツール。議事録化はエージェント側で実施する。
 
-> 最初に `tools/meeting/agents.md` を確認すること。
+> 最初に `tools/meeting/AGENTS.md` を確認すること。
 
 ## コマンド一覧
 
 | コマンド | 説明 |
 |---------|------|
-| `meeting start "会議名" --カテゴリ [--web] [--platform]` | 録音開始 |
-| `meeting stop [--async]` | 録音停止 → 文字起こし → 要約 → 保存 → Slack通知 |
+| `meeting start "会議名" --カテゴリ [--web] [--platform] [--hold|--no-hold]` | 録音開始 |
+| `meeting stop [--async]` | 録音停止 → 文字起こし（.txt生成） |
 | `meeting setup-async` | Windowsの非同期runnerタスクを作成/確認 |
 | `meeting status` | 録音/文字起こしワーカーの状態を表示 |
 | `meeting list` | 録音一覧を表示 |
-| `meeting reprocess <transcript.txt>` | 既存文字起こしの再処理（分類/要約/通知を再実行） |
+| `meeting reprocess <transcript.txt>` | 既存文字起こしの再処理（分類/要約を再実行） |
 | `meeting import <memo.md>` | コピペ文字起こしメモの取り込み |
 
 ## カテゴリと保存先
@@ -52,10 +52,16 @@ meeting start "週次定例" --web --platform meet
 meeting stop
 ```
 
+### startの待機モード
+
+- `--hold`: `meeting stop`まで`meeting start`を待機させる
+- `--no-hold`: 従来どおり`meeting start`を即時終了する
+- デフォルト: `MEETING_START_HOLD_MODE=auto`（非対話実行では`--hold`相当、対話ターミナルでは`--no-hold`相当）
+
 ### バックグラウンド処理
 
 ```sh
-meeting stop --async  # 文字起こし/要約をバックグラウンドで実行
+meeting stop --async  # 文字起こしをバックグラウンドで実行
 ```
 
 ## Windowsでの使い方
@@ -154,20 +160,20 @@ meeting start "Kondate Loop定例" --プライベート --side-business kondate-
 ┌─────────────────────────────────────────────────────────────┐
 │  1. 録音停止 → WAVファイル保存                                │
 │  2. Whisperで文字起こし                                      │
-│  3. LLMで要約・議事録生成                                     │
-│  4. knowledge/meetings/ 配下に保存                           │
-│  5. Slack通知（開始/終了/完成）                               │
+│  3. knowledge/meetings/_audio/ に txt保存                     │
+│  4. 必要なら reprocess/import で議事録化                      │
+│  5. Slack通知（開始/終了）                                    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ## 要点サマリーとTODO
 
-- 要点サマリーは文字起こしの冒頭/末尾を使って生成し、TODO（特にItsukiのアクション）を必ず拾う。
+- 要点サマリー/TODOの抽出は `meeting reprocess` で実行できる。
 - TODOが空の場合は `meeting reprocess` で再生成するか、議事録に手動で追記する。
 
 ## 再処理（reprocess）
 
-既存の文字起こしファイルから、分類/要約/Slack通知を再実行する。
+既存の文字起こしファイルから、分類/要約を再実行する。
 
 ```sh
 meeting reprocess /path/to/transcript.txt
@@ -183,7 +189,7 @@ meeting reprocess transcript.txt --md /path/to/meeting.md --replace
 
 ## メモ取り込み（import）
 
-コピペした文字起こしメモを取り込み、完了通知を送信する（要約は生成しない）。
+コピペした文字起こしメモを取り込み、議事録化する（要約はデフォルトで生成しない）。
 
 ```sh
 meeting import /path/to/memo.md
@@ -237,20 +243,20 @@ meeting import /path/to/memo.md --社内
 ## 録音ファイル
 
 - **一時保存先**: `knowledge/meetings/_audio/`
-- **削除タイミング**: 要点サマリーまで成功した場合
+- **削除タイミング**: 文字起こし（.txt生成）まで成功した場合
 - **保持したい場合**: `MEETING_KEEP_AUDIO=1`
-- **短い録音で要約省略時**: 保持（削除は `MEETING_DELETE_AUDIO_ON_SHORT=1`）
 - **失敗時**: 録音データを残し、手動再処理可能
+- **開始時の健全性チェック**: 既定で4秒以内に1KB以上の書き込みがない録音は失敗として中止
+- **ffmpegログ**: `knowledge/meetings/_audio/*.ffmpeg.log` に保存（録音開始失敗時の調査用）
 
 ## Slack通知
 
 - `SLACK_WEBHOOK_URL` を使用（`tools/podcast-summarizer/.env` を自動読み込み）
 - 別Webhookを使う場合は `MEETING_SLACK_WEBHOOK_URL` を設定
-- 通知タイミング: 録音開始 / 録音終了 / 議事録完成
+- 通知タイミング: 録音開始 / 録音終了
 - 通知内容:
   - 録音開始: `録音を開始しました-会議名:{会議名} {環境(対面/Meet/Teams/Zoom/Web)}`
   - 録音終了: `録音を終了しました-{時間} 文字起こし中...`
-  - 議事録完成: `議事録を作成しました` + `パス` + `要点/決定事項/TODO`
 
 ## ログ・トラブル対応
 
@@ -259,6 +265,7 @@ meeting import /path/to/memo.md --社内
 - **保存先**: `knowledge/meetings/log/`
 - **日次ログ**: `meeting-YYYY-MM-DD.log`
 - **保持期間**: 14日（`MEETING_LOG_RETENTION_DAYS` で変更可能）
+- **自動クリーンアップ**: 期限超過した `*.ffmpeg.log` と 0B `*.wav` も起動時に削除
 
 ### トラブルシューティング
 
@@ -273,7 +280,8 @@ meeting import /path/to/memo.md --社内
 
 ## ファイル名規則
 
-- 形式: `YYYYMMDD_会議名.md`
+- 録音/文字起こし: `YYYY-MM-DD_HHMM_会議名.wav/.txt`
+- 再処理で作る議事録: `YYYYMMDD_会議名.md`
 - 同日同名: `_02` 以降の連番で回避
 - 会議名が無題/不明: 文字起こしからタイトルを推測
 - 会議名に日付が含まれる場合: ファイル名では先頭の日付のみ使用

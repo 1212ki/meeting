@@ -4,10 +4,10 @@
 # Meeting Recording Tool
 # ====================================
 # 使い方:
-#   meeting start "会議名" --商談                         - 商談の録音開始
-#   meeting start "会議名" --社内                         - 社内会議の録音開始
-#   meeting start "会議名" --プライベート                - プライベートの録音開始
-#   meeting start "会議名" --商談 --web                   - WEB商談の録音開始
+#   meeting start "会議名" --商談 [--hold|--no-hold]                - 商談の録音開始
+#   meeting start "会議名" --社内 [--hold|--no-hold]                - 社内会議の録音開始
+#   meeting start "会議名" --プライベート [--hold|--no-hold]       - プライベートの録音開始
+#   meeting start "会議名" --商談 --web [--hold|--no-hold]          - WEB商談の録音開始
 #   meeting start "会議名" --プライベート --side-business kondate-loop --web
 #                                                    - 個人事業のWEB会議を録音開始
 #   meeting stop [--async]                            - 録音停止 → 文字起こし → 要約
@@ -30,9 +30,12 @@ AUDIO_BACKUP_FILE="$AUDIO_DIR/.audio_output_backup"
 OUTPUT_WATCH_PID_FILE="$AUDIO_DIR/.output_watch.pid"
 
 KEEP_AUDIO="${MEETING_KEEP_AUDIO:-0}"
-DELETE_AUDIO_ON_SHORT="${MEETING_DELETE_AUDIO_ON_SHORT:-0}"
 SUMMARY_MIN_CHARS="${MEETING_SUMMARY_MIN_CHARS:-400}"
 LOG_RETENTION_DAYS="${MEETING_LOG_RETENTION_DAYS:-14}"
+RECORDING_HEALTH_CHECKS="${MEETING_RECORDING_HEALTH_CHECKS:-6}"
+RECORDING_HEALTH_CHECKS_WEB="${MEETING_RECORDING_HEALTH_CHECKS_WEB:-14}"
+RECORDING_HEALTH_INTERVAL="${MEETING_RECORDING_HEALTH_INTERVAL:-1}"
+RECORDING_MIN_BYTES="${MEETING_RECORDING_MIN_BYTES:-1024}"
 WHISPER_MODEL="${MEETING_WHISPER_MODEL:-small}"
 WHISPER_LANG="${MEETING_WHISPER_LANGUAGE:-Japanese}"
 WHISPER_BIN="${MEETING_WHISPER_BIN:-${WHISPER_PATH:-}}"
@@ -52,6 +55,7 @@ MEETING_WEB_LIMITER_FILTER="${MEETING_WEB_LIMITER_FILTER:-alimiter=limit=0.95:at
 
 MEETING_STORAGE_MODE="${MEETING_STORAGE_MODE:-auto}"
 MEETING_AUTO_STOP="${MEETING_AUTO_STOP:-1}"
+MEETING_START_HOLD_MODE="${MEETING_START_HOLD_MODE:-auto}"
 MEETING_SLACK_ASYNC="${MEETING_SLACK_ASYNC:-1}"
 
 # 色付け
@@ -73,6 +77,10 @@ rotate_logs() {
     if [ -d "$LOG_DIR" ]; then
         find "$LOG_DIR" -type f -name 'meeting-*.log' -mtime "+$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
     fi
+    if [ -d "$AUDIO_DIR" ]; then
+        find "$AUDIO_DIR" -type f -name '*.ffmpeg.log' -mtime "+$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
+        find "$AUDIO_DIR" -type f -name '*.wav' -size 0 -mtime "+$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
+    fi
 }
 
 ensure_dirs() {
@@ -81,25 +89,135 @@ ensure_dirs() {
     mkdir -p "$MEETINGS_DIR/side-business" "$MEETINGS_DIR/activities" "$MEETINGS_DIR/thoughts" "$MEETINGS_DIR/life"
 }
 
+cleanup_recording_state() {
+    rm -f "$PID_FILE" "$INFO_FILE"
+}
+
+is_process_running() {
+    local pid="$1"
+    [ -n "$pid" ] && ps -p "$pid" >/dev/null 2>&1
+}
+
+resolve_hold_mode() {
+    local explicit="$1"
+    if [ "$explicit" = "1" ] || [ "$explicit" = "0" ]; then
+        printf '%s' "$explicit"
+        return 0
+    fi
+
+    case "$MEETING_START_HOLD_MODE" in
+        always|ALWAYS|1|true|TRUE|yes|YES)
+            printf '1'
+            ;;
+        never|NEVER|0|false|FALSE|no|NO)
+            printf '0'
+            ;;
+        auto|AUTO|"")
+            if [ -t 1 ]; then
+                printf '0'
+            else
+                printf '1'
+            fi
+            ;;
+        *)
+            if [ -t 1 ]; then
+                printf '0'
+            else
+                printf '1'
+            fi
+            ;;
+    esac
+}
+
+get_file_size_bytes() {
+    local file="$1"
+    if [ ! -f "$file" ]; then
+        printf '0'
+        return 0
+    fi
+    local bytes
+    bytes=$(wc -c < "$file" 2>/dev/null | tr -d '[:space:]')
+    if [ -z "$bytes" ]; then
+        bytes="0"
+    fi
+    printf '%s' "$bytes"
+}
+
+show_ffmpeg_log_tail() {
+    local ffmpeg_log="$1"
+    if [ -z "$ffmpeg_log" ] || [ ! -f "$ffmpeg_log" ]; then
+        return 0
+    fi
+    echo -e "${YELLOW}ffmpegログ（末尾）: ${ffmpeg_log}${NC}"
+    tail -n 20 "$ffmpeg_log" | sed 's/^/  /'
+}
+
+stop_recording_process() {
+    local pid="$1"
+    if ! is_process_running "$pid"; then
+        return 0
+    fi
+    kill -INT "$pid" 2>/dev/null || true
+    local wait_count=0
+    while [ "$wait_count" -lt 5 ]; do
+        if ! is_process_running "$pid"; then
+            return 0
+        fi
+        sleep 1
+        wait_count=$((wait_count + 1))
+    done
+    if is_process_running "$pid"; then
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+}
+
+wait_for_recording_data() {
+    local pid="$1"
+    local audio_file="$2"
+    local mode="${3:-}"
+    local checks="$RECORDING_HEALTH_CHECKS"
+    if [ "$mode" = "web" ]; then
+        checks="$RECORDING_HEALTH_CHECKS_WEB"
+    fi
+    local interval="$RECORDING_HEALTH_INTERVAL"
+    local min_bytes="$RECORDING_MIN_BYTES"
+    local i=0
+
+    while [ "$i" -lt "$checks" ]; do
+        if ! is_process_running "$pid"; then
+            return 1
+        fi
+        local bytes
+        bytes="$(get_file_size_bytes "$audio_file")"
+        if [ "$bytes" -ge "$min_bytes" ]; then
+            return 0
+        fi
+        sleep "$interval"
+        i=$((i + 1))
+    done
+
+    return 1
+}
+
 show_help() {
     cat << EOF
 Meeting Recording Tool
 
 使い方:
-  meeting start "会議名" --商談        商談の録音開始
-  meeting start "会議名" --社内        社内会議の録音開始
-  meeting start "会議名" --プライベート        プライベートの録音開始
-  meeting start "会議名" --商談 --web  WEB商談の録音
+  meeting start "会議名" --商談 [--hold|--no-hold]        商談の録音開始
+  meeting start "会議名" --社内 [--hold|--no-hold]        社内会議の録音開始
+  meeting start "会議名" --プライベート [--hold|--no-hold]        プライベートの録音開始
+  meeting start "会議名" --商談 --web [--hold|--no-hold]  WEB商談の録音
   meeting start "会議名" --プライベート --side-business kondate-loop --web
                                       個人事業のWEB会議を録音
-  meeting stop [--async]              録音停止 → 文字起こし → 要約
+  meeting stop [--async]              録音停止 → 文字起こし（.txt生成）
   meeting list                         録音一覧を表示
   meeting reprocess <transcript.txt> [--md <path>] [--replace]
   meeting import <memo.md>
 
 例:
   meeting start "A社プレゼン" --商談
-  meeting start "週次定例" --社内
+  meeting start "週次定例" --社内 --hold
   meeting start "B社Zoom" --商談 --web
   meeting stop
 
@@ -307,6 +425,10 @@ audio_device_exists() {
     if [ -z "$target" ]; then
         return 1
     fi
+    if command -v SwitchAudioSource >/dev/null 2>&1; then
+        SwitchAudioSource -a 2>/dev/null | grep -qxF "$target"
+        return $?
+    fi
     system_profiler SPAudioDataType 2>/dev/null | awk -v target="$target" '
         /^[[:space:]]+[^:]+:$/ {
             name=$0
@@ -325,25 +447,21 @@ resolve_restore_output_device() {
     local match
 
     if is_earphone_connected; then
-        if audio_device_exists "$MEETING_AUDIO_EARPHONE"; then
-            printf '%s' "$MEETING_AUDIO_EARPHONE"
-            return 0
-        fi
         devices="$(get_available_output_devices)"
         if [ -n "$devices" ]; then
-            match="$(printf '%s\n' "$devices" | grep -iE 'ヘッドフォン|イヤホン|AirPods|Headphone|Earphone' | head -n 1)"
+            match="$(printf '%s\n' "$devices" | grep -v "^会議用" | grep -iE 'ヘッドフォン|イヤホン|AirPods|Headphone|Earphone' | head -n 1)"
             if [ -n "$match" ]; then
                 printf '%s' "$match"
                 return 0
             fi
         fi
-    else
-        local builtin
-        builtin="$(get_builtin_speaker_device)"
-        if [ -n "$builtin" ]; then
-            printf '%s' "$builtin"
-            return 0
-        fi
+    fi
+
+    local builtin
+    builtin="$(get_builtin_speaker_device)"
+    if [ -n "$builtin" ]; then
+        printf '%s' "$builtin"
+        return 0
     fi
 
     printf '%s' "$(get_default_output_device)"
@@ -388,12 +506,12 @@ switch_to_meeting_output() {
         return 0
     fi
 
-    if [ -n "$current" ]; then
-        printf '%s' "$current" > "$AUDIO_BACKUP_FILE"
-    fi
-
     if [ "$current" = "$target" ]; then
         return 0
+    fi
+
+    if [ -n "$current" ]; then
+        printf '%s' "$current" > "$AUDIO_BACKUP_FILE"
     fi
 
     SwitchAudioSource -s "$target" -t output >/dev/null 2>&1 || true
@@ -416,20 +534,36 @@ start_output_watcher() {
 
     stop_output_watcher
 
-    (
+    nohup bash -c '
+        earphone='"'$MEETING_AUDIO_EARPHONE'"'
+        speaker='"'$MEETING_AUDIO_SPEAKER'"'
+        interval='"$interval"'
         while true; do
-            local target
-            local current
-            target="$(resolve_web_output_device)"
-            current="$(get_default_output_device)"
-            if [ -n "$target" ] && [ "$current" != "$target" ]; then
-                SwitchAudioSource -s "$target" -t output >/dev/null 2>&1 || true
+            has_earphone="$(SwitchAudioSource -a -t output 2>/dev/null | grep -v "^会議用" | grep -iE "ヘッドフォン|イヤホン|AirPods|Headphone|Earphone" | head -n 1)"
+            if [ -n "$has_earphone" ]; then
+                want="$earphone"
+            else
+                want="$speaker"
+            fi
+            current="$(SwitchAudioSource -t output -c 2>/dev/null)"
+            if [ -n "$want" ] && [ "$current" != "$want" ]; then
+                SwitchAudioSource -s "$want" -t output >/dev/null 2>/dev/null
             fi
             sleep "$interval"
         done
-    ) &
+    ' >/dev/null 2>&1 &
 
     echo $! > "$OUTPUT_WATCH_PID_FILE"
+}
+
+sync_multisoundchanger() {
+    if ! pgrep -f MultiSoundChanger >/dev/null 2>&1; then
+        return 0
+    fi
+    killall MultiSoundChanger 2>/dev/null || true
+    sleep 0.5
+    open -a MultiSoundChanger 2>/dev/null || true
+    sleep 0.5
 }
 
 stop_output_watcher() {
@@ -439,6 +573,11 @@ stop_output_watcher() {
         rm -f "$OUTPUT_WATCH_PID_FILE"
         if [ -n "$watch_pid" ]; then
             kill "$watch_pid" 2>/dev/null || true
+            local wait_count=0
+            while is_process_running "$watch_pid" && [ "$wait_count" -lt 5 ]; do
+                sleep 0.2
+                wait_count=$((wait_count + 1))
+            done
         fi
     fi
 }
@@ -507,10 +646,20 @@ list_avfoundation_audio_devices() {
     '
 }
 
+first_avfoundation_audio_index() {
+    local devices="$1"
+    printf '%s\n' "$devices" | sed -nE 's/.*\[([0-9]+)\].*/\1/p' | head -n 1
+}
+
 resolve_avfoundation_index() {
     local device_name="$1"
+    local devices="${2:-}"
     if [ -z "$device_name" ]; then
         return 1
+    fi
+
+    if [ -z "$devices" ]; then
+        devices="$(list_avfoundation_audio_devices)"
     fi
 
     local line
@@ -523,7 +672,7 @@ resolve_avfoundation_index() {
             printf '%s' "$index"
             return 0
         fi
-    done <<< "$(list_avfoundation_audio_devices)"
+    done <<< "$devices"
 
     return 1
 }
@@ -1145,6 +1294,7 @@ start_recording() {
     local project_name=""
     local web_mode=""
     local platform=""
+    local hold_mode=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1192,11 +1342,22 @@ start_recording() {
                 platform="$2"
                 shift 2
                 ;;
+            --hold)
+                hold_mode="1"
+                shift
+                ;;
+            --no-hold)
+                hold_mode="0"
+                shift
+                ;;
             *)
                 shift
                 ;;
         esac
     done
+
+    local effective_hold_mode
+    effective_hold_mode="$(resolve_hold_mode "$hold_mode")"
 
     if [ -z "$meeting_name" ]; then
         echo -e "${RED}エラー: 会議名を指定してください${NC}"
@@ -1206,7 +1367,7 @@ start_recording() {
     if [ -f "$PID_FILE" ]; then
         local old_pid
         old_pid=$(cat "$PID_FILE" 2>/dev/null || true)
-        if [ -n "$old_pid" ] && ps -p "$old_pid" > /dev/null 2>&1; then
+        if is_process_running "$old_pid"; then
             if [ "$MEETING_AUTO_STOP" = "1" ]; then
                 echo -e "${YELLOW}録音中のため停止してから開始します...${NC}"
                 stop_recording "--async" || true
@@ -1215,13 +1376,17 @@ start_recording() {
                 echo "停止するには: meeting stop"
                 exit 1
             fi
+        else
+            echo -e "${YELLOW}警告: 前回録音の状態ファイルが残っていたためクリアしました${NC}"
+            log_message "WARN" "stale recording state cleared: pid=${old_pid:-empty}"
+            cleanup_recording_state
         fi
     fi
 
     check_dependencies
 
     local date_str
-    date_str=$(date +"%Y-%m-%d_%H%M")
+    date_str=$(date +"%Y-%m-%d_%H%M%S")
     local clean_name
     clean_name="$(strip_date_prefix "$meeting_name")"
     clean_name="$(normalize_title "$clean_name")"
@@ -1232,6 +1397,7 @@ start_recording() {
     safe_name="$(sanitize_filename "$clean_name")"
     local filename="${date_str}_${safe_name}"
     local audio_file="$AUDIO_DIR/${filename}.wav"
+    local ffmpeg_log_file="$AUDIO_DIR/${filename}.ffmpeg.log"
 
     echo ""
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -1246,7 +1412,19 @@ start_recording() {
     if [ -n "$web_mode" ]; then
         warn_multisoundchanger
         switch_to_meeting_output
-        start_output_watcher
+        sync_multisoundchanger
+    fi
+
+    local avfoundation_devices
+    avfoundation_devices="$(list_avfoundation_audio_devices)"
+    if [ -z "$avfoundation_devices" ]; then
+        echo -e "${RED}エラー: AVFoundationの音声デバイス一覧を取得できませんでした${NC}"
+        echo "ターミナルのマイク権限確認後に再実行してください"
+        echo "確認コマンド: ffmpeg -f avfoundation -list_devices true -i \"\""
+        if [ -n "$web_mode" ]; then
+            restore_audio_output
+        fi
+        exit 1
     fi
 
     if [ -n "$web_mode" ]; then
@@ -1261,27 +1439,23 @@ start_recording() {
         mic_device="$(resolve_input_device_name)"
 
         local blackhole_index
-        blackhole_index="$(resolve_avfoundation_index "$blackhole_device" || true)"
+        blackhole_index="$(resolve_avfoundation_index "$blackhole_device" "$avfoundation_devices" || true)"
         local mic_index
-        mic_index="$(resolve_avfoundation_index "$mic_device" || true)"
+        mic_index="$(resolve_avfoundation_index "$mic_device" "$avfoundation_devices" || true)"
 
         if [ -n "$blackhole_index" ] && [ -n "$mic_index" ] && [ "$blackhole_index" != "$mic_index" ]; then
             local filter="[0:a]volume=${MEETING_WEB_INPUT_GAIN_BLACKHOLE}[bh];[1:a]volume=${MEETING_WEB_INPUT_GAIN_MIC}[mic];[bh][mic]amix=inputs=2:duration=longest:dropout_transition=2[mix]"
-            if [ "$MEETING_WEB_AUTO_LEVEL" = "1" ]; then
-                filter+=";[mix]dynaudnorm[mix2]"
-            else
-                filter+=";[mix]anull[mix2]"
-            fi
             if [ "$MEETING_WEB_LIMITER" = "1" ]; then
-                filter+=";[mix2]${MEETING_WEB_LIMITER_FILTER}[out]"
+                filter+=";[mix]${MEETING_WEB_LIMITER_FILTER}[out]"
             else
-                filter+=";[mix2]anull[out]"
+                filter+=";[mix]anull[out]"
             fi
 
             echo -e "  入力: ${BLUE}$mic_device${NC} + ${BLUE}$blackhole_device${NC}"
-            ffmpeg -f avfoundation -i ":$blackhole_index" -f avfoundation -i ":$mic_index" \
+            : > "$ffmpeg_log_file"
+            ffmpeg -y -f avfoundation -i ":$blackhole_index" -f avfoundation -i ":$mic_index" \
                 -filter_complex "$filter" -map "[out]" -acodec pcm_s16le -ar 16000 "$audio_file" \
-                >/dev/null 2>&1 &
+                >/dev/null 2>>"$ffmpeg_log_file" &
         else
             local target_index
             target_index="$mic_index"
@@ -1292,19 +1466,36 @@ start_recording() {
                 echo -e "  入力: ${BLUE}${mic_device:-既定入力}${NC}"
             fi
             if [ -z "$target_index" ]; then
-                target_index="0"
+                target_index="$(first_avfoundation_audio_index "$avfoundation_devices" || true)"
+                if [ -n "$target_index" ]; then
+                    echo -e "${YELLOW}警告: 入力デバイス名を解決できないため先頭デバイス(index:${target_index})を使用します${NC}"
+                fi
             fi
-            ffmpeg -f avfoundation -i ":$target_index" -acodec pcm_s16le -ar 16000 "$audio_file" >/dev/null 2>&1 &
+            if [ -z "$target_index" ]; then
+                echo -e "${RED}エラー: 有効な音声入力デバイスを解決できませんでした${NC}"
+                restore_audio_output
+                exit 1
+            fi
+            : > "$ffmpeg_log_file"
+            ffmpeg -y -f avfoundation -i ":$target_index" -acodec pcm_s16le -ar 16000 -flush_packets 1 "$audio_file" >/dev/null 2>>"$ffmpeg_log_file" &
         fi
     else
         local mic_device
         mic_device="$(get_default_audio_device)"
         local mic_index
-        mic_index="$(resolve_avfoundation_index "$mic_device" || true)"
+        mic_index="$(resolve_avfoundation_index "$mic_device" "$avfoundation_devices" || true)"
         if [ -z "$mic_index" ]; then
-            mic_index="0"
+            mic_index="$(first_avfoundation_audio_index "$avfoundation_devices" || true)"
+            if [ -n "$mic_index" ]; then
+                echo -e "${YELLOW}警告: 既定入力を解決できないため先頭デバイス(index:${mic_index})を使用します${NC}"
+            fi
         fi
-        ffmpeg -f avfoundation -i ":$mic_index" -acodec pcm_s16le -ar 16000 "$audio_file" >/dev/null 2>&1 &
+        if [ -z "$mic_index" ]; then
+            echo -e "${RED}エラー: 有効な音声入力デバイスを解決できませんでした${NC}"
+            exit 1
+        fi
+        : > "$ffmpeg_log_file"
+        ffmpeg -y -f avfoundation -i ":$mic_index" -acodec pcm_s16le -ar 16000 -flush_packets 1 "$audio_file" >/dev/null 2>>"$ffmpeg_log_file" &
     fi
 
     local pid=$!
@@ -1312,10 +1503,26 @@ start_recording() {
     start_epoch=$(date +%s)
 
     echo "$pid" > "$PID_FILE"
-    echo "${filename}|${meeting_name}|${category}|${storage_area}|${project_name}|${platform}|${web_mode}|${start_epoch}" > "$INFO_FILE"
+    echo "${filename}|${meeting_name}|${category}|${storage_area}|${project_name}|${platform}|${web_mode}|${start_epoch}|${ffmpeg_log_file}" > "$INFO_FILE"
 
-    sleep 1
-    if ps -p "$pid" > /dev/null 2>&1; then
+    if is_process_running "$pid"; then
+        if ! wait_for_recording_data "$pid" "$audio_file" "$([ -n "$web_mode" ] && echo web)"; then
+            stop_recording_process "$pid"
+            cleanup_recording_state
+            if [ -n "$web_mode" ]; then
+                restore_audio_output
+            fi
+            local bytes
+            bytes="$(get_file_size_bytes "$audio_file")"
+            if [ "$bytes" -eq 0 ]; then
+                rm -f "$audio_file" 2>/dev/null || true
+            fi
+            echo -e "${RED}エラー: 録音ストリームが安定せず開始に失敗しました${NC}"
+            echo -e "${YELLOW}入力デバイス/マイク権限を確認して再実行してください${NC}"
+            log_message "ERROR" "recording health check failed: ${meeting_name} (bytes=${bytes})"
+            show_ffmpeg_log_tail "$ffmpeg_log_file"
+            exit 1
+        fi
         echo -e "${GREEN}  録音中... 🎙️${NC}"
         echo ""
         echo "  停止するには: meeting stop"
@@ -1324,9 +1531,23 @@ start_recording() {
         local env_label
         env_label="$(resolve_env_label "$web_mode" "$platform")"
         send_start_notification "$meeting_name" "$env_label"
+        if [ "$effective_hold_mode" = "1" ]; then
+            echo "  --hold モードで待機中（終了は meeting stop）"
+            while [ -f "$PID_FILE" ]; do
+                sleep 1
+            done
+        fi
     else
         echo -e "${RED}エラー: 録音の開始に失敗しました${NC}"
-        rm -f "$PID_FILE" "$INFO_FILE"
+        cleanup_recording_state
+        if [ -n "$web_mode" ]; then
+            restore_audio_output
+        fi
+        if [ "$(get_file_size_bytes "$audio_file")" -eq 0 ]; then
+            rm -f "$audio_file" 2>/dev/null || true
+        fi
+        log_message "ERROR" "recording start failed: ${meeting_name}"
+        show_ffmpeg_log_tail "$ffmpeg_log_file"
         exit 1
     fi
 }
@@ -1355,41 +1576,63 @@ stop_recording() {
     local platform=""
     local web_mode=""
     local start_epoch=""
+    local ffmpeg_log_file=""
 
-    IFS='|' read -r filename meeting_name category storage_area project_name platform web_mode start_epoch <<< "$info"
+    IFS='|' read -r filename meeting_name category storage_area project_name platform web_mode start_epoch ffmpeg_log_file <<< "$info"
+    if [ -z "$filename" ]; then
+        echo -e "${RED}エラー: 録音状態が壊れています（ファイル名が空）${NC}"
+        log_message "ERROR" "invalid recording info: $INFO_FILE"
+        cleanup_recording_state
+        return 1
+    fi
 
     local audio_file="$AUDIO_DIR/${filename}.wav"
+    if [ -z "$ffmpeg_log_file" ] && [ -n "$filename" ]; then
+        ffmpeg_log_file="$AUDIO_DIR/${filename}.ffmpeg.log"
+    fi
 
     echo ""
     echo -e "${YELLOW}録音を停止しています...${NC}"
 
-    kill -INT "$pid" 2>/dev/null || true
-    sleep 2
-
-    if ps -p "$pid" > /dev/null 2>&1; then
-        kill -9 "$pid" 2>/dev/null || true
+    if is_process_running "$pid"; then
+        stop_recording_process "$pid"
+    else
+        echo -e "${YELLOW}警告: 録音プロセスは既に終了していました${NC}"
+        log_message "WARN" "recording process already stopped: pid=${pid:-empty}"
     fi
 
-    rm -f "$PID_FILE" "$INFO_FILE"
+    cleanup_recording_state
 
     local end_epoch
     end_epoch=$(date +%s)
+
+    if [ -n "$web_mode" ]; then
+        restore_audio_output
+        sync_multisoundchanger
+    fi
+
+    if [ ! -f "$audio_file" ]; then
+        echo -e "${RED}エラー: 音声ファイルが見つかりません${NC}"
+        exit 1
+    fi
+
+    local file_size_bytes
+    file_size_bytes="$(get_file_size_bytes "$audio_file")"
+    if [ "$file_size_bytes" -le 0 ]; then
+        echo -e "${RED}エラー: 録音データが空(0B)です。文字起こしを中止しました${NC}"
+        echo -e "${YELLOW}入力デバイス/マイク権限を確認して再度録音してください${NC}"
+        log_message "ERROR" "empty recording detected: $audio_file"
+        show_ffmpeg_log_tail "$ffmpeg_log_file"
+        rm -f "$audio_file" 2>/dev/null || true
+        return 1
+    fi
+
     if [ -n "$start_epoch" ]; then
         local duration
         local diff
         diff=$((end_epoch - start_epoch))
         duration=$(printf '%dm%02ds' $((diff / 60)) $((diff % 60)))
         send_stop_notification "$duration"
-    fi
-
-    if [ -n "$web_mode" ]; then
-        stop_output_watcher
-        restore_audio_output
-    fi
-
-    if [ ! -f "$audio_file" ]; then
-        echo -e "${RED}エラー: 音声ファイルが見つかりません${NC}"
-        exit 1
     fi
 
     local file_size
@@ -1414,6 +1657,14 @@ process_recording() {
     local storage_area="$5"
     local project_name="$6"
     local platform="$7"
+
+    local audio_size_bytes
+    audio_size_bytes="$(get_file_size_bytes "$audio_file")"
+    if [ "$audio_size_bytes" -le 0 ]; then
+        echo -e "${RED}文字起こしに失敗しました（音声データが空です）${NC}"
+        log_message "ERROR" "transcription skipped due to empty audio: $audio_file"
+        return 1
+    fi
 
     echo -e "${YELLOW}文字起こしを開始します...${NC}"
     echo "（初回は数分かかる場合があります - モデルのダウンロードのため）"
